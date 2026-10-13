@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>拼车路线优化系统</title>
+<script type="text/javascript" src="https://api.map.baidu.com/api?v=3.0&ak=GyAoEPtKgtOFUvT2kdzgAYZIGZqUEAGV"></script>
+<style>
+  body { margin: 0; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f5f7fa; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+  .header { background: linear-gradient(135deg, #409eff, #66b1ff); color: #fff; padding: 24px; border-radius: 8px; margin-bottom: 20px; }
+  .header h1 { margin: 0; font-size: 22px; }
+  .header p { margin: 8px 0 0; opacity: 0.9; font-size: 14px; }
+  .card { background: #fff; border-radius: 8px; padding: 20px; margin-bottom: 16px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); }
+  .card h2 { margin: 0 0 16px; font-size: 16px; color: #303133; border-left: 4px solid #409eff; padding-left: 10px; }
+  .mode-btn { padding: 8px 18px; border: 1px solid #dcdfe6; background: #fff; color: #606266; cursor: pointer; font-size: 14px; }
+  .mode-btn:first-of-type { border-radius: 4px 0 0 4px; }
+  .mode-btn:last-of-type { border-radius: 0 4px 4px 0px; margin-left: -1px; }
+  .mode-btn.mode-active { background: #409eff; border-color: #409eff; color: #fff; }
+  .grid2 { display: grid; grid-template-columns: 1.5fr 1fr; gap: 20px; }
+  .field-label { font-size: 12px; color: #909399; margin: 0 0 6px; }
+  .text-input { width: 100%; box-sizing: border-box; font-size: 13px; padding: 8px 10px; border: 1px solid #dcdfe6; border-radius: 4px; }
+  .text-input:focus { border-color: #409eff; outline: none; }
+  .mini-btn { padding: 5px 12px; font-size: 12px; border: 1px solid #dcdfe6; background:#fff; border-radius: 5px; cursor: pointer; }
+  .mini-btn:hover { border-color: #409eff; color: #409eff; }
+  .btn-primary { padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; background: #409eff; color: #fff; }
+  .btn-primary:disabled { background: #a0cfff; cursor: not-allowed; }
+  #pick_map { width: 100%; height: 170px; border-radius: 6px; margin-top: 10px; border: 1px solid #ebeef5; }
+  .status-tag { font-size: 11px; padding: 2px 8px; border-radius: 10px; white-space: nowrap; flex: none; }
+  .st-ok { background: #f0f9eb; color: #67c23a; }
+  .st-fail { background: #fef0f0; color: #f56c6c; }
+  .st-wait { background: #fdf6ec; color: #e6a23c; }
+  .row-line { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .row-line .in-name { width: 90px; flex: none; }
+  .row-line .in-addr { flex: 1; }
+  .row-del { flex: none; width: 26px; height: 26px; border: 1px solid #dcdfe6; background: #fff; border-radius: 4px; color: #909399; cursor: pointer; font-size: 14px; line-height: 1; }
+  .row-del:hover { border-color: #f56c6c; color: #f56c6c; }
+  .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 16px 0; }
+  .summary-item { background: #f5f7fa; padding: 16px; border-radius: 6px; text-align: center; }
+  .summary-item .label { font-size: 12px; color: #909399; margin-bottom: 4px; }
+  .summary-item .value { font-size: 20px; font-weight: bold; color: #303133; }
+  .summary-item .value.green { color: #67c23a; }
+  .vehicle-item { border: 1px solid #e4e7ed; border-left: 4px solid #409eff; border-radius: 6px; padding: 14px; margin-bottom: 10px; }
+  .vehicle-item .order-line { font-size: 13px; color: #606266; margin-top: 8px; }
+  .timeline { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .tl-chip { font-size: 12px; background: #f4f6f9; border-radius: 12px; padding: 3px 10px; color: #606266; }
+  .tl-chip.first { background: #ecf5ff; color: #409eff; }
+  .tl-chip.last { background: #fef0f0; color: #f56c6c; }
+  #map { width: 100%; height: 500px; border-radius: 8px; margin: 16px 0; }
+  #map_card:fullscreen #map { height: 90vh; }
+  #map_card:-webkit-full-screen #map { height: 90vh; }
+  .legend-item { display:flex; align-items:center; gap:6px; padding:4px 10px; border:1px solid #e4e7ed; border-radius:16px; cursor:pointer; font-size:13px; user-select:none; }
+  .legend-item.off { opacity: 0.35; }
+  .legend-dot { width:12px; height:12px; border-radius:50%; display:inline-block; }
+  .legend-star { color:#f56c6c; font-size:14px; line-height:1; }
+  .loading { padding: 20px; text-align: center; color: #909399; }
+  .step-bar { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #909399; }
+  .step-dot { width: 10px; height: 10px; border-radius: 50%; background: #dcdfe6; flex: none; }
+  .step-dot.done { background: #67c23a; }
+  .step-dot.active { background: #409eff; box-shadow: 0 0 0 3px rgba(64,158,255,.2); }
+  .step-line { flex: 1; height: 1px; background: #ebeef5; max-width: 80px; }
+  .err-bar { display: none; background: #fef0f0; border: 1px solid #fde2e2; color: #f56c6c; border-radius: 6px; padding: 10px 14px; font-size: 13px; margin-bottom: 16px; }
+  .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .confirm-mask { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 100; }
+  .confirm-box { position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%); width: 420px; max-width: 92vw; background: #fff; border-radius: 10px; padding: 22px; }
+  .confirm-box h3 { margin: 0 0 14px; font-size: 16px; }
+  .confirm-row { display: flex; justify-content: space-between; font-size: 13px; padding: 6px 0; border-bottom: 1px dashed #ebeef5; }
+  .confirm-row .k { color: #909399; }
+  .confirm-warn { background: #fdf6ec; color: #e6a23c; font-size: 12px; border-radius: 6px; padding: 8px 10px; margin-top: 12px; }
+  .confirm-btns { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+  @media (max-width: 720px) {
+    .summary { grid-template-columns: repeat(2, 1fr); }
+    .grid2 { grid-template-columns: 1fr; }
+    .container { padding: 12px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>拼车路线优化系统</h1>
+    <p>集合 / 散场 · 费用最优 · 真实路网 · 每站时间线</p>
+  </div>
+
+  <div class="err-bar" id="err_bar"></div>
+
+  <!-- 任务配置 -->
+  <div class="card">
+    <h2>任务配置</h2>
+    <div style="margin: 4px 0 16px;">
+      <label style="font-size:13px; color:#606266;">模式：</label>
+      <button id="mode_pickup" class="mode-btn mode-active">集合（接人）</button>
+      <button id="mode_dropoff" class="mode-btn">散场（送人）</button>
+      <span style="font-size:12px; color:#909399; margin-left:10px;">集合：各自出发前往活动点 · 散场：从活动点送往各自住宿点</span>
+    </div>
+    <div class="grid2">
+      <div>
+        <p class="field-label"><span id="dest_name">活动点</span>（出发点）：输入地址检索，或点击 / 拖拽地图选点</p>
+        <div style="display:flex; gap:8px;">
+          <input class="text-input" id="dest_addr" placeholder="如：郑州东站 P3 停车场" value="郑州东站">
+          <button class="mini-btn" id="dest_search_btn" style="flex:none;">检索</button>
+        </div>
+        <div style="display:flex; gap:8px; margin-top:8px; align-items:center;">
+          <span class="status-tag st-ok" id="dest_status">已定位</span>
+          <span style="font-size:12px; color:#909399;" id="dest_coord">34.7421, 113.7536</span>
+        </div>
+        <div id="pick_map"></div>
+      </div>
+      <div>
+        <div style="margin-bottom:14px;">
+          <p class="field-label">优化模式</p>
+          <select class="text-input" id="opt_mode">
+            <option value="cost">费用最优</option>
+            <option value="balanced">时间均衡</option>
+            <option value="fewest_vehicles">车辆最少</option>
+          </select>
+        </div>
+        <div style="margin-bottom:14px;">
+          <p class="field-label">求解预算（秒）</p>
+          <input class="text-input" id="time_budget" type="number" value="10" min="5" max="300">
+          <p style="font-size:11px; color:#c0c4cc; margin:4px 0 0;">算得越久越省，60 秒后收益递减</p>
+        </div>
+        <div>
+          <p class="field-label" id="depart_label">预计出发时间</p>
+          <input class="text-input" id="depart_time" type="time" value="18:00">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 名单 -->
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+      <h2 style="margin:0;" id="passenger_title">乘客名单（姓名 + 地址，失焦自动解析坐标）</h2>
+      <span style="font-size:12px; color:#909399;" id="rows_count"></span>
+    </div>
+    <div id="passenger_rows"></div>
+    <div style="display:flex; gap:8px; margin-top:12px; align-items:center;">
+      <button class="mini-btn" id="add_row_btn">+ 添加一行</button>
+      <button class="mini-btn" id="load_demo_btn">载入示例（15 人）</button>
+      <button class="mini-btn" id="csv_btn">上传 CSV</button>
+      <input type="file" id="csv_file" accept=".csv,.txt" style="display:none;">
+      <span style="flex:1;"></span>
+      <button class="btn-primary" id="submit_btn">提交优化任务</button>
+    </div>
+  </div>
+
+  <!-- 进度 -->
+  <div class="card loading" id="progress" style="display:none;">
+    <div class="step-bar">
+      <span class="step-dot" id="sd1"></span>构建距离矩阵
+      <span class="step-line"></span>
+      <span class="step-dot" id="sd2"></span>生成初始方案
+      <span class="step-line"></span>
+      <span class="step-dot" id="sd3"></span>ALNS 优化中
+      <span style="margin-left:auto;" id="elapsed_wrap">已运行 <b id="elapsed">0</b> 秒</span>
+    </div>
+  </div>
+
+  <!-- 地图 -->
+  <div class="card" id="map_card" style="display:none;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <h2 style="margin:0;">路线地图</h2>
+      <div>
+        <button id="btn_select_all" class="mini-btn" style="margin-right:6px;">全选</button>
+        <button id="btn_fullscreen" class="mini-btn">全屏</button>
+      </div>
+    </div>
+    <div id="legend" style="margin:10px 0; display:flex; flex-wrap:wrap; gap:10px;"></div>
+    <div id="map"></div>
+  </div>
+
+  <!-- 结果 -->
+  <div class="card" id="result_card" style="display:none;">
+    <div class="toolbar">
+      <h2 style="margin:0;">优化结果</h2>
+      <div>
+        <button class="mini-btn" id="copy_btn" style="margin-right:6px;">复制结果</button>
+        <button class="mini-btn" id="csv_export_btn">导出 CSV</button>
+      </div>
+    </div>
+    <div class="summary">
+      <div class="summary-item"><div class="label">优化后总费用</div><div class="value" id="total_cost"></div></div>
+      <div class="summary-item"><div class="label">单独叫车 baseline</div><div class="value" id="baseline_cost"></div></div>
+      <div class="summary-item"><div class="label">节省</div><div class="value green" id="savings"></div></div>
+      <div class="summary-item"><div class="label">费用下降率</div><div class="value green" id="saving_rate"></div></div>
+    </div>
+    <div id="vehicles_list"></div>
+  </div>
+</div>
+
+<!-- 提交前确认 -->
+<div class="confirm-mask" id="confirm_mask">
+  <div class="confirm-box">
+    <h3>确认提交</h3>
+    <div class="confirm-row"><span class="k">模式</span><span id="cf_mode"></span></div>
+    <div class="confirm-row"><span class="k">人数</span><span id="cf_count"></span></div>
+    <div class="confirm-row"><span class="k" id="cf_dest_k">活动点</span><span id="cf_dest"></span></div>
+    <div class="confirm-row"><span class="k">优化模式</span><span id="cf_optmode"></span></div>
+    <div class="confirm-row"><span class="k">求解预算</span><span id="cf_budget"></span></div>
+    <div class="confirm-row"><span class="k">出发时间</span><span id="cf_depart"></span></div>
+    <div class="confirm-warn" id="cf_warn" style="display:none;"></div>
+    <div class="confirm-btns">
+      <button class="mini-btn" id="cf_cancel">取消</button>
+      <button class="btn-primary" id="cf_ok" style="padding:6px 16px; font-size:13px;">确认提交</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const VEHICLE_COLORS = ['#409eff', '#67c23a', '#e6a23c', '#f56c6c', '#909399', '#9c27b0'];
+const DEMO = [
+  ['乘客01', '汉庭酒店郑州东站店', 34.745, 113.740],
+  ['乘客02', '全季酒店郑州东站店', 34.742, 113.745],
+  ['乘客03', '郑州悦栖酒店', 34.750, 113.735],
+  ['乘客04', '郑州大学主校区', 34.813, 113.535],
+  ['乘客05', '二七广场', 34.748, 113.658],
+  ['乘客06', '郑州火车站', 34.752, 113.657],
+  ['乘客07', '紫荆山公园', 34.755, 113.690],
+  ['乘客08', '河南博物院', 34.753, 113.618],
+  ['乘客09', '凯德广场兴达路店', 34.740, 113.720],
+  ['乘客10', '郑州东站西广场', 34.747, 113.760],
+  ['乘客11', '绿地新都会', 34.735, 113.745],
+  ['乘客12', '郑州国际会展中心', 34.738, 113.730],
+  ['乘客13', '曼哈顿商业广场', 34.730, 113.700],
+  ['乘客14', '航海体育场', 34.720, 113.680],
+  ['乘客15', '市体育中心', 34.770, 113.740],
+];
+
+let map = null;
+let pickMap = null;
+let destPoint = null;
+let destMarker = null;
+let geocoder = null;
+let elapsedTimer = null;
+let currentDirection = 'pickup';
+let currentResult = null;
+let visibleVehicles = new Set();
+let passengers = [];       // {name, address, lat, lng, status: ok|fail|''}
+let geoQueue = Promise.resolve();
+
+// ---------- 地图 ----------
+function initBaseMap() {
+  map = new BMap.Map('map');
+  map.centerAndZoom(new BMap.Point(113.70, 34.74), 11);
+  map.enableScrollWheelZoom(true);
+  map.addControl(new BMap.NavigationControl());
+  map.addControl(new BMap.ScaleControl());
+  try { map.addControl(new BMap.FullScreenControl()); } catch(e) {}
+}
+
+function initPickMap() {
+  geocoder = new BMap.Geocoder();
+  pickMap = new BMap.Map('pick_map');
+  pickMap.centerAndZoom(new BMap.Point(113.7536, 34.7421), 13);
+  setDestPoint(new BMap.Point(113.7536, 34.7421), true);
+  pickMap.addEventListener('click', function(e) { setDestPoint(e.point); });
+}
+
+function setDestPoint(pt, silent) {
+  destPoint = pt;
+  if (destMarker) { destMarker.setPosition(pt); }
+  else {
+    destMarker = new BMap.Marker(pt, { enableDragging: true });
+    destMarker.addEventListener('dragend', function() { setDestPoint(destMarker.point); });
+    pickMap.addOverlay(destMarker);
+  }
+  if (!silent) pickMap.panTo(pt);
+  document.getElementById('dest_coord').textContent =
+      pt.lat.toFixed(4) + ', ' + pt.lng.toFixed(4);
+}
+
+function geocodeDest() {
+  const addr = document.getElementById('dest_addr').value.trim();
+  if (!addr) { showErr('请先输入活动点地址'); return; }
+  const tag = document.getElementById('dest_status');
+  tag.className = 'status-tag st-wait';
+  tag.textContent = '检索中...';
+  geocoder.getPoint(addr, function(pt) {
+    if (pt) {
+      setDestPoint(pt);
+      tag.className = 'status-tag st-ok';
+      tag.textContent = '已定位';
+      hideErr();
+    } else {
+      tag.className = 'status-tag st-fail';
+      tag.textContent = '未找到该地址';
+    }
+  }, '郑州市');
+}
+
+// ---------- 模式 ----------
+function setDirection(dir) {
+  currentDirection = (dir === 'dropoff') ? 'dropoff' : 'pickup';
+  document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('mode-active'));
+  document.getElementById(currentDirection === 'dropoff' ? 'mode_dropoff' : 'mode_pickup')
+          .classList.add('mode-active');
+  const isDrop = currentDirection === 'dropoff';
+  document.getElementById('dest_name').textContent = isDrop ? '活动点（出发点）' : '活动点（终点）';
+  document.getElementById('passenger_title').textContent =
+      isDrop ? '住宿点名单（姓名 + 地址，失焦自动解析坐标）' : '乘客名单（姓名 + 地址，失焦自动解析坐标）';
+  document.getElementById('depart_label').textContent =
+      isDrop ? '预计发车时间' : '预计出发接人时间';
+  document.getElementById('cf_dest_k').textContent = isDrop ? '活动点（出发）' : '活动点（终点）';
+}
+
+// ---------- 名单表格 ----------
+function addRow(name, address, lat, lng, status) {
+  const i = passengers.length;
+  passengers.push({ name: name || '', address: address || '', lat: lat || null,
+                    lng: lng || null, status: status || '' });
+  const div = document.createElement('div');
+  div.className = 'row-line';
+  div.dataset.i = i;
+  div.innerHTML =
+      '<input class="text-input in-name" placeholder="姓名" value="' + (name || '') + '">' +
+      '<input class="text-input in-addr" placeholder="地址，如：汉庭酒店郑州东站店" value="' + (address || '') + '">' +
+      '<span class="status-tag" id="row_st_' + i + '"></span>' +
+      '<button class="row-del" title="删除本行">×</button>';
+  document.getElementById('passenger_rows').appendChild(div);
+  const nameInput = div.querySelector('.in-name');
+  const addrInput = div.querySelector('.in-addr');
+  nameInput.addEventListener('input', () => { passengers[i].name = nameInput.value.trim(); });
+  addrInput.addEventListener('change', () => {
+    passengers[i].address = addrInput.value.trim();
+    geocodeRow(i);
+  });
+  div.querySelector('.row-del').addEventListener('click', () => removeRow(div));
+  setRowStatus(i);
+  updateRowsCount();
+}
+
+function removeRow(rowEl) {
+  const i = parseInt(rowEl.dataset.i, 10);
+  passengers.splice(i, 1);
+  rowEl.remove();
+  // 重建索引与 data-i，保证 passengers 与 DOM 对齐
+  const rows = document.querySelectorAll('#passenger_rows .row-line');
+  passengers.forEach((p, idx) => { rows[idx].dataset.i = idx; });
+  updateRowsCount();
+}
+
+function setRowStatus(i) {
+  const tag = document.getElementById('row_st_' + i);
+  const p = passengers[i];
+  if (!tag || !p) return;
+  if (p.status === 'ok') { tag.className = 'status-tag st-ok'; tag.textContent = '已解析'; }
+  else if (p.status === 'fail') { tag.className = 'status-tag st-fail'; tag.textContent = '定位失败'; }
+  else if (p.status === 'wait') { tag.className = 'status-tag st-wait'; tag.textContent = '解析中'; }
+  else { tag.className = 'status-tag'; tag.textContent = ''; }
+}
+
+function geocodeRow(i) {
+  const p = passengers[i];
+  if (!p || !p.address) {
+    p.lat = p.lng = null; p.status = '';
+    setRowStatus(i); updateRowsCount(); return;
+  }
+  p.status = 'wait'; setRowStatus(i);
+  // 串行队列，避免并发触发百度 QPS 限制
+  geoQueue = geoQueue.then(() => new Promise(resolve => {
+    geocoder.getPoint(p.address, function(pt) {
+      if (pt) { p.lat = pt.lat; p.lng = pt.lng; p.status = 'ok'; }
+      else { p.lat = p.lng = null; p.status = 'fail'; }
+      setRowStatus(i); updateRowsCount();
+      resolve();
+    }, '郑州市');
+  }));
+}
+
+function updateRowsCount() {
+  const ok = passengers.filter(p => p.status === 'ok').length;
+  document.getElementById('rows_count').textContent =
+      passengers.length ? ('已解析 ' + ok + ' / ' + passengers.length + ' 人') : '';
+}
+
+function loadDemo() {
+  document.getElementById('passenger_rows').innerHTML = '';
+  passengers = [];
+  DEMO.forEach(d => addRow(d[0], d[1], d[2], d[3], 'ok'));
+}
+
+function parseCSV(text) {
+  document.getElementById('passenger_rows').innerHTML = '';
+  passengers = [];
+  text.split(/\r?\n/).forEach(line => {
+    line = line.trim();
+    if (!line) return;
+    const parts = line.split(/[,\t]/).map(s => s.trim());
+    if (parts.length >= 3 && !isNaN(parseFloat(parts[1])) && !isNaN(parseFloat(parts[2]))) {
+      addRow(parts[0], parts.slice(3).join(',') || parts[0], parseFloat(parts[1]), parseFloat(parts[2]), 'ok');
+    } else if (parts.length >= 2) {
+      addRow(parts[0], parts.slice(1).join(','), null, null, '');
+    }
+  });
+}
+
+// ---------- 错误条 ----------
+function showErr(msg) {
+  const bar = document.getElementById('err_bar');
+  bar.textContent = msg;
+  bar.style.display = 'block';
+}
+function hideErr() { document.getElementById('err_bar').style.display = 'none'; }
+
+// ---------- 提交 ----------
+function collectPassengers() {
+  return passengers.filter(p => p.status === 'ok' && p.name);
+}
+
+function openConfirm() {
+  const ps = collectPassengers();
+  if (!ps.length) {
+    showErr('没有可提交的名单：请至少输入一行并等待地址解析成功');
+    return;
+  }
+  if (!destPoint) { showErr('请先设置活动点位置'); return; }
+  hideErr();
+  const failCount = passengers.filter(p => p.status === 'fail').length;
+  document.getElementById('cf_mode').textContent =
+      currentDirection === 'dropoff' ? '散场（送人）' : '集合（接人）';
+  document.getElementById('cf_count').textContent = ps.length + ' 人';
+  document.getElementById('cf_dest').textContent =
+      destPoint.lat.toFixed(4) + ', ' + destPoint.lng.toFixed(4);
+  const modeSel = document.getElementById('opt_mode');
+  document.getElementById('cf_optmode').textContent =
+      modeSel.options[modeSel.selectedIndex].text;
+  document.getElementById('cf_budget').textContent =
+      document.getElementById('time_budget').value + ' 秒';
+  document.getElementById('cf_depart').textContent =
+      document.getElementById('depart_time').value || '未设置';
+  const warn = document.getElementById('cf_warn');
+  if (failCount > 0) {
+    warn.style.display = 'block';
+    warn.textContent = '有 ' + failCount + ' 个地址定位失败，将不参与本次优化';
+  } else { warn.style.display = 'none'; }
+  document.getElementById('confirm_mask').style.display = 'block';
+}
+
+async function submitTask() {
+  document.getElementById('confirm_mask').style.display = 'none';
+  const ps = collectPassengers();
+  if (!ps.length || !destPoint) return;
+
+  const btn = document.getElementById('submit_btn');
+  btn.disabled = true;
+  btn.textContent = '提交中...';
+  document.getElementById('progress').style.display = 'block';
+  document.getElementById('result_card').style.display = 'none';
+  document.getElementById('map_card').style.display = 'none';
+  setStep(-1);
+
+  const startTime = Date.now();
+  clearInterval(elapsedTimer);
+  elapsedTimer = setInterval(() => {
+    document.getElementById('elapsed').textContent =
+        Math.floor((Date.now() - startTime) / 1000);
+  }, 1000);
+
+  try {
+    const resp = await fetch('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        passengers: ps.map(p => ({ name: p.name, lat: p.lat, lng: p.lng })),
+        dest_lat: destPoint.lat,
+        dest_lng: destPoint.lng,
+        mode: document.getElementById('opt_mode').value,
+        time_budget_s: parseInt(document.getElementById('time_budget').value),
+        direction: currentDirection
+      })
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    const taskId = data.task_id;
+
+    const poll = setInterval(async () => {
+      try {
+        const r = await fetch('/api/tasks/' + taskId);
+        const d = await r.json();
+        setStep(d.stage);
+        if (d.status === 'DONE') {
+          clearInterval(poll); clearInterval(elapsedTimer);
+          showResult(d.result);
+          btn.disabled = false;
+          btn.textContent = '提交优化任务';
+        } else if (d.status === 'FAILED') {
+          clearInterval(poll); clearInterval(elapsedTimer);
+          document.getElementById('progress').style.display = 'none';
+          showErr('优化失败: ' + (d.error || '未知错误'));
+          btn.disabled = false;
+          btn.textContent = '提交优化任务';
+        }
+      } catch (e) { console.error('轮询错误:', e); }
+    }, 2000);
+  } catch (e) {
+    clearInterval(elapsedTimer);
+    document.getElementById('progress').style.display = 'none';
+    showErr('提交任务失败: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = '提交优化任务';
+  }
+}
+
+// stage: matrix / initial / alns / done / failed / pending
+function setStep(stage) {
+  const s = { sd1: 0, sd2: 1, sd3: 2 };
+  const map_ = { matrix: 0, initial: 1, alns: 2, done: 3 };
+  const cur = map_[stage];
+  ['sd1', 'sd2', 'sd3'].forEach((id, idx) => {
+    const el = document.getElementById(id);
+    el.className = 'step-dot';
+    if (cur === undefined || cur === -1) return;
+    if (cur === 3 || idx < cur) el.classList.add('done');
+    else if (idx === cur) el.classList.add('active');
+  });
+}
+
+// ---------- 结果展示 ----------
+function addrOf(name) {
+  const p = passengers.find(x => x.name === name);
+  return (p && p.address) ? p.address : '';
+}
+
+function fmtTime(mins) {
+  mins = ((mins % 1440) + 1440) % 1440;
+  const h = Math.floor(mins / 60), m = Math.round(mins % 60);
+  return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+}
+
+function parseTime(str) {
+  const parts = (str || '18:00').split(':');
+  return (parseInt(parts[0], 10) || 0) * 60 + (parseInt(parts[1], 10) || 0);
+}
+
+function timelineHTML(v, isDrop) {
+  const start = parseTime(document.getElementById('depart_time').value);
+  const legs = v.leg_durations || [];
+  const n = v.coordinates.length;
+  let t = start;
+  let html = '<div class="timeline">';
+  v.coordinates.forEach((c, i) => {
+    const hasTime = legs.length >= n - 1;
+    const tag = i === 0 ? 'first' : (i === n - 1 ? 'last' : '');
+    const suffix = hasTime ? (' ' + fmtTime(t)) : '';
+    const role = i === 0 ? (isDrop ? '出发' : '上车') : (i === n - 1 ? (isDrop ? '送达' : '到达') : '途经');
+    html += '<span class="tl-chip ' + tag + '">' + suffix + ' ' + c.name +
+            (role ? '（' + role + '）' : '') + '</span>';
+    if (i < n - 1 && legs[i] != null) t += legs[i];
+  });
+  html += '</div>';
+  return html;
+}
+
+function showResult(result) {
+  document.getElementById('result_card').style.display = 'block';
+  document.getElementById('map_card').style.display = 'block';
+  document.getElementById('progress').style.display = 'none';
+
+  document.getElementById('total_cost').textContent = '¥' + result.total_cost;
+  document.getElementById('baseline_cost').textContent = '¥' + result.baseline_cost;
+  document.getElementById('savings').textContent = '¥' + result.savings;
+  document.getElementById('saving_rate').textContent = result.saving_rate + '%';
+
+  const isDrop = result.direction === 'dropoff';
+  const list = document.getElementById('vehicles_list');
+  list.innerHTML = '<p>共 <b>' + result.vehicle_count + '</b> 辆车 · 出发时间 <b>' +
+      (document.getElementById('depart_time').value || '未设置') + '</b></p>';
+  result.vehicles.forEach((v, idx) => {
+    const color = VEHICLE_COLORS[idx % VEHICLE_COLORS.length];
+    const orderLine = isDrop
+        ? '<b style="color:#f56c6c;">活动点</b> → ' + v.order.join(' → ')
+        : v.order.join(' → ') + ' → <b style="color:#f56c6c;">终点</b>';
+    list.innerHTML += `
+      <div class="vehicle-item" style="border-left-color: ${color}">
+        <div style="display: flex; justify-content: space-between;">
+          <b style="color: ${color}">${v.vehicle_id}（${v.passenger_count} 人）</b>
+          <span style="font-size: 12px; color: #909399;">${v.distance_km} km · ${v.duration_min} 分钟 · ¥${v.cost}</span>
+        </div>
+        <div class="order-line">${orderLine}</div>
+        ${timelineHTML(v, isDrop)}
+      </div>`;
+  });
+  setTimeout(() => initMap(result), 100);
+}
+
+function resultText() {
+  const r = currentResult;
+  if (!r) return '';
+  const isDrop = r.direction === 'dropoff';
+  const depart = document.getElementById('depart_time').value || '未设置';
+  let out = '拼车方案（' + (isDrop ? '散场' : '集合') + '）· ' + r.vehicle_count +
+            ' 辆车 · ' + r.vehicles.reduce((s, v) => s + v.passenger_count, 0) + ' 人\n';
+  out += '总费用 ¥' + r.total_cost + '（单独叫车 ¥' + r.baseline_cost + '，节省 ' +
+         r.saving_rate + '%）\n';
+  r.vehicles.forEach(v => {
+    out += '\n' + v.vehicle_id + '（' + v.passenger_count + ' 人）' + v.distance_km + 'km · ' +
+           v.duration_min + '分钟 · ¥' + v.cost + '\n';
+    const start = parseTime(depart);
+    const legs = v.leg_durations || [];
+    let t = start;
+    v.coordinates.forEach((c, i) => {
+      const addr = addrOf(c.name);
+      out += '  ' + fmtTime(t) + '  ' + c.name + (addr ? '（' + addr + '）' : '') + '\n';
+      if (i < v.coordinates.length - 1 && legs[i] != null) t += legs[i];
+    });
+  });
+  return out;
+}
+
+function copyResult() {
+  const text = resultText();
+  if (!text) return;
+  const done = () => { const b = document.getElementById('copy_btn');
+                       b.textContent = '已复制'; setTimeout(() => b.textContent = '复制结果', 1500); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+  } else { fallbackCopy(text, done); }
+}
+
+function fallbackCopy(text, done) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); done(); } catch (e) { showErr('复制失败，请手动选择文本'); }
+  document.body.removeChild(ta);
+}
+
+function exportCSV() {
+  const r = currentResult;
+  if (!r) return;
+  const isDrop = r.direction === 'dropoff';
+  const rows = [['车号', '顺序', '姓名', '地址', '预计时刻', '里程km', '时长分钟', '费用元']];
+  const start = parseTime(document.getElementById('depart_time').value);
+  r.vehicles.forEach(v => {
+    const legs = v.leg_durations || [];
+    let t = start;
+    v.coordinates.forEach((c, i) => {
+      rows.push([v.vehicle_id, i + 1, c.name, addrOf(c.name), fmtTime(t)]);
+      if (i < v.coordinates.length - 1 && legs[i] != null) t += legs[i];
+    });
+    rows.push([v.vehicle_id, '合计', '', '', '', v.distance_km, v.duration_min, v.cost]);
+  });
+  const csv = '\uFEFF' + rows.map(row =>
+    row.map(cell => {
+      const s = String(cell == null ? '' : cell);
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }).join(',')
+  ).join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = '拼车方案_' + (isDrop ? '散场' : '集合') + '_' + r.task_id + '.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ---------- 地图绘制 ----------
+function makeIcon(shape, color, scale) {
+  const shapeConst = shape === 'star' ? BMap.Symbol_BMAP_SHAPE_STAR5 : BMap.Symbol_BMAP_SHAPE_CIRCLE;
+  return new BMap.Symbol(shapeConst, {
+    scale: scale, fillColor: color, fillOpacity: 0.95,
+    strokeColor: '#ffffff', strokeWeight: 1.5
+  });
+}
+
+function renderMap() {
+  if (!map || !currentResult) return;
+  map.clearOverlays();
+  const allPoints = [];
+  const symbolOk = typeof BMap.Symbol === 'function' && typeof BMap.Symbol_BMAP_SHAPE_STAR5 !== 'undefined';
+  const isDrop = currentResult.direction === 'dropoff';
+
+  currentResult.vehicles.forEach((v, vIdx) => {
+    if (!visibleVehicles.has(vIdx)) return;
+    const color = VEHICLE_COLORS[vIdx % VEHICLE_COLORS.length];
+    const coords = v.coordinates;
+    if (!coords || coords.length === 0) return;
+
+    const pathCoords = (v.path && v.path.length > 1) ? v.path : coords;
+    const points = pathCoords.map(c => new BMap.Point(c.lng, c.lat));
+    allPoints.push(...points);
+    map.addOverlay(new BMap.Polyline(points, {
+      strokeColor: color, strokeWeight: 5, strokeOpacity: 0.85
+    }));
+
+    coords.forEach((c, i) => {
+      const pt = new BMap.Point(c.lng, c.lat);
+      const isDest = isDrop ? (i === 0) : (i === coords.length - 1);
+      const ptColor = isDest ? '#f56c6c' : color;
+      if (symbolOk) {
+        const icon = makeIcon(isDest ? 'star' : 'circle', ptColor, isDest ? 14 : 9);
+        map.addOverlay(new BMap.Marker(pt, { icon: icon }));
+      } else {
+        map.addOverlay(new BMap.Circle(pt, isDest ? 500 : 250, {
+          strokeColor: ptColor, strokeWeight: 2, fillColor: ptColor, fillOpacity: 0.7
+        }));
+      }
+      const label = new BMap.Label(c.name, { offset: new BMap.Size(10, -12) });
+      label.setStyle({
+        backgroundColor: ptColor, color: '#fff', borderRadius: '4px',
+        padding: '2px 6px', border: 'none', fontSize: '12px', fontWeight: 'bold'
+      });
+      label.setPosition(pt);
+      map.addOverlay(label);
+    });
+  });
+  if (allPoints.length > 0) map.setViewport(allPoints);
+}
+
+function renderLegend() {
+  const legend = document.getElementById('legend');
+  legend.innerHTML = '';
+  currentResult.vehicles.forEach((v, vIdx) => {
+    const color = VEHICLE_COLORS[vIdx % VEHICLE_COLORS.length];
+    const item = document.createElement('div');
+    item.className = 'legend-item';
+    item.innerHTML = '<span class="legend-dot" style="background:' + color + '"></span>' +
+        '<b style="color:' + color + '">' + v.vehicle_id + '</b>' +
+        '<span style="color:#909399;font-size:12px">' + v.passenger_count + '人</span>';
+    item.addEventListener('click', () => {
+      if (visibleVehicles.has(vIdx)) { visibleVehicles.delete(vIdx); item.classList.add('off'); }
+      else { visibleVehicles.add(vIdx); item.classList.remove('off'); }
+      renderMap();
+    });
+    legend.appendChild(item);
+  });
+  const destItem = document.createElement('div');
+  destItem.className = 'legend-item';
+  destItem.style.cursor = 'default';
+  destItem.innerHTML = '<span class="legend-star">★</span><span>' +
+      (currentResult.direction === 'dropoff' ? '活动点' : '终点') + '</span>';
+  legend.appendChild(destItem);
+}
+
+function initMap(result) {
+  if (!map) initBaseMap();
+  currentResult = result;
+  visibleVehicles = new Set(result.vehicles.map((_, i) => i));
+  renderLegend();
+  renderMap();
+}
+
+// ---------- 事件绑定 ----------
+document.getElementById('mode_pickup').addEventListener('click', () => setDirection('pickup'));
+document.getElementById('mode_dropoff').addEventListener('click', () => setDirection('dropoff'));
+document.getElementById('dest_search_btn').addEventListener('click', geocodeDest);
+document.getElementById('dest_addr').addEventListener('keydown', e => {
+  if (e.key === 'Enter') geocodeDest();
+});
+document.getElementById('add_row_btn').addEventListener('click', () => addRow());
+document.getElementById('load_demo_btn').addEventListener('click', loadDemo);
+document.getElementById('csv_btn').addEventListener('click', () =>
+  document.getElementById('csv_file').click());
+document.getElementById('csv_file').addEventListener('change', e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = () => parseCSV(reader.result);
+  reader.readAsText(f, 'UTF-8');
+  e.target.value = '';
+});
+document.getElementById('submit_btn').addEventListener('click', openConfirm);
+document.getElementById('cf_cancel').addEventListener('click', () =>
+  document.getElementById('confirm_mask').style.display = 'none');
+document.getElementById('cf_ok').addEventListener('click', submitTask);
+document.getElementById('confirm_mask').addEventListener('click', e => {
+  if (e.target.id === 'confirm_mask') e.target.style.display = 'none';
+});
+document.getElementById('copy_btn').addEventListener('click', copyResult);
+document.getElementById('csv_export_btn').addEventListener('click', exportCSV);
+
+document.getElementById('btn_fullscreen').addEventListener('click', () => {
+  const card = document.getElementById('map_card');
+  if (!document.fullscreenElement) {
+    (card.requestFullscreen || card.webkitRequestFullscreen).call(card);
+  } else {
+    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+  }
+});
+
+document.getElementById('btn_select_all').addEventListener('click', () => {
+  if (!currentResult) return;
+  if (visibleVehicles.size === currentResult.vehicles.length) {
+    visibleVehicles.clear();
+  } else {
+    visibleVehicles = new Set(currentResult.vehicles.map((_, i) => i));
+  }
+  document.querySelectorAll('#legend .legend-item').forEach((el, i) => {
+    if (i < currentResult.vehicles.length) {
+      el.classList.toggle('off', !visibleVehicles.has(i));
+    }
+  });
+  renderMap();
+});
+
+// ---------- 启动 ----------
+// 防呆：file:// 直接打开时 fetch 必失败（相对路径解析成 file:///api/...）
+if (location.protocol === 'file:') {
+  const bar = document.getElementById('err_bar');
+  bar.style.display = 'block';
+  bar.innerHTML = '页面是通过本地文件（file://）打开的，无法连接后端服务。' +
+    '请在浏览器地址栏输入 <b>http://localhost:8000/</b> 访问（需先启动后端）。';
+}
+initBaseMap();
+initPickMap();
+setDirection('pickup');
+loadDemo();
+</script>
+</body>
+</html>

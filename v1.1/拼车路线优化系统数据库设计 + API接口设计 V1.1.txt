@@ -1,0 +1,956 @@
+# 拼车路线优化系统数据库设计 + API接口设计 V1.1
+
+文档性质：
+
+> 面向后端开发、数据库工程师、前端开发的系统设计文档。
+
+V1.1 变更说明：根据《P0 冲突统一决策 V1.1》修订——数据库从 MySQL+Redis+OSS 改为单机 SQLite 3、删除 user 表（V1.0 不做登录）、optimization_job.status 补全 8 种并增加 sub_status、route_passenger 增加分摊金额与个人乘车明细字段、新增 /passengers 接口、WebSocket 消息体扩展、solution 表增加 baseline_cost 字段。
+
+目标：
+
+建立一个支持：
+
+- 拼车任务创建
+- 地理数据管理
+- 地图矩阵缓存
+- 候选路线存储
+- 优化任务执行
+- 方案版本管理
+- 结果展示
+- 历史查询
+
+的完整数据体系。
+
+---
+
+# 一、系统总体架构
+
+整体数据流：
+
+```
+用户创建拼车任务
+
+        |
+        ↓
+
+任务数据库
+
+        |
+        ↓
+
+地图数据服务
+
+        |
+        ↓
+
+距离时间矩阵缓存
+
+        |
+        ↓
+
+算法优化服务
+
+        |
+        ↓
+
+方案数据库
+
+        |
+        ↓
+
+前端展示/API
+```
+
+
+---
+
+# 二、数据库设计原则
+
+## 1. 数据库选型（V1.1）
+
+推荐：
+
+### 主数据库：SQLite 3
+
+V1.1 不再使用 MySQL。理由：
+- V1.0 定位为单机工具，不做多用户 SaaS；
+- SQLite 3 是文件型数据库，随项目目录走，零部署；
+- 30 人规模数据量极小，SQLite 完全够用；
+- 字段类型映射：bigint→INTEGER、decimal→REAL、datetime→TEXT(ISO8601)、json→TEXT(JSON 字符串)。
+
+负责：
+- 拼车任务
+- 人员信息
+- 方案结果
+- 地图矩阵缓存
+- 优化任务状态
+- 地图配额计数
+
+---
+
+### 缓存：内存 + SQLite
+
+V1.1 不再使用 Redis。地图矩阵、优化中间状态直接放 Python 进程内 dict，关键数据持久化到 SQLite。进程重启后从 SQLite 恢复矩阵缓存。
+
+---
+
+### 文件存储：无
+
+V1.1 不使用 OSS/MinIO。地图 polyline 直接存 vehicle_route 表的 TEXT 字段。导出文件 V1.0 不做。
+
+
+---
+
+# 三、核心业务实体关系
+
+
+```
+用户
+
+ |
+ |
+拼车任务
+ |
+ |------乘客
+ |
+ |------优化任务
+ |
+ |------路线方案
+              |
+              |
+          车辆路线
+              |
+              |
+          路线乘客
+```
+
+
+---
+
+# 四、数据库表设计
+
+
+# 1. 用户表 user
+
+
+用途：
+
+系统用户。
+
+
+# 1. 用户表（V1.1 删除）
+
+V1.1 不做登录、不做多用户隔离，user 表整表删除。V2.0 多用户时再加。
+
+---
+
+# 2. 拼车任务表 carpool_task
+
+
+核心表。
+
+
+```sql
+carpool_task
+```
+
+
+|字段|类型|说明|
+|-|-|-|
+|id|INTEGER|任务ID|
+|task_name|TEXT|任务名称|
+|status|TEXT|任务状态|
+|passenger_count|INTEGER|人数|
+|destination_name|TEXT|终点名称|
+|destination_lng|REAL|经度|
+|destination_lat|REAL|纬度|
+|coordinate_type|TEXT|坐标类型（BD09/WGS84/GCJ02）|
+|vehicle_mode|TEXT|车型模式（auto/four/six）|
+|optimization_mode|TEXT|优化模式（cost/balanced/fewest_vehicles）|
+|baseline_cost|REAL|全部单独叫车费用总和，用于归一化|
+|created_at|TEXT|创建时间 ISO8601|
+
+
+status：
+
+```
+CREATED
+
+MAPPING（阶段 0：取地图数据）
+
+OPTIMIZING（阶段 1+2：优化中）
+
+COMPLETED
+
+FAILED
+```
+
+
+---
+
+# 3. 乘客表 passenger
+
+
+```sql
+passenger
+```
+
+
+|字段|类型|说明|
+|-|-|-|
+|id|bigint|ID|
+|task_id|bigint|任务|
+|name|varchar|姓名|
+|external_id|varchar|业务编号|
+|lng|decimal|经度|
+|lat|decimal|纬度|
+|coordinate_source|varchar|原始坐标|
+|bd09_lng|decimal|百度经度|
+|bd09_lat|decimal|百度纬度|
+|direct_duration|int|直达秒数|
+|valid_status|varchar|状态|
+
+
+valid_status:
+
+```
+VALID
+
+DIRECT_TIMEOUT
+
+INVALID_COORD
+```
+
+
+---
+
+# 4. 地图矩阵表 map_matrix
+
+
+核心性能表。
+
+
+保存：
+
+点到点距离时间。
+
+
+```sql
+map_matrix
+```
+
+
+|字段|类型|说明|
+|-|-|-|
+|id|bigint||
+|task_id|bigint||
+|from_point|varchar||
+|to_point|varchar||
+|distance_meter|int|米|
+|duration_second|int|秒|
+|provider|varchar|百度|
+|data_time|datetime||
+
+
+索引：
+
+```
+(task_id,from_point,to_point)
+```
+
+
+---
+
+# 5. 候选路线表 candidate_route
+
+
+算法候选池。
+
+
+```sql
+candidate_route
+```
+
+
+|字段|类型|说明|
+|-|-|-|
+|id|bigint||
+|task_id|bigint||
+|vehicle_type|tinyint|4/6|
+|passenger_ids|json|乘客列表|
+|stop_order|json|接人顺序|
+|estimate_distance|int||
+|estimate_duration|int||
+|estimate_cost|decimal||
+|score|decimal||
+|status|varchar||
+
+
+status：
+
+```
+ACTIVE
+
+DISCARD
+```
+
+
+---
+
+# 6. 优化任务表 optimization_job
+
+
+记录算法执行。
+
+
+```sql
+optimization_job
+```
+
+
+|字段|类型|说明|
+|-|-|-|
+|id|INTEGER||
+|task_id|INTEGER||
+|algorithm|TEXT|ALNS|
+|start_time|TEXT||
+|end_time|TEXT||
+|budget_second|INTEGER||
+|status|TEXT|8 种状态之一（见下）|
+|sub_status|TEXT|null|FAILED 时细分：PROVEN_INFEASIBLE / SEARCH_FAILED|
+|best_cost|REAL||
+|iteration|INTEGER||
+|candidate_count|INTEGER||
+|gap|REAL|null|
+
+
+status（V1.1 全量 8 种）：
+
+```
+INIT
+FEASIBLE
+OPTIMIZING
+STOP_GAP
+STOP_TIMEOUT
+STOP_STABLE
+OPTIMAL
+FAILED
+```
+
+
+---
+
+# 7. 方案表 solution
+
+
+一次优化可能产生多个方案。
+
+
+```sql
+solution
+```
+
+
+|字段|类型|说明|
+|-|-|-|
+|id|INTEGER||
+|task_id|INTEGER||
+|job_id|INTEGER||
+|version|INTEGER||
+|total_cost|REAL||
+|total_distance|INTEGER||
+|total_duration|INTEGER||
+|vehicle_count|INTEGER||
+|four_seat_count|INTEGER|4 人车型数量|
+|six_seat_count|INTEGER|6 人车型数量|
+|is_best|INTEGER||
+|status|TEXT||
+
+
+例如：
+
+方案版本：
+
+```
+V1 初始方案
+
+V2 优化方案
+
+V3 最终方案
+```
+
+
+---
+
+# 8. 车辆路线表 vehicle_route
+
+
+```sql
+vehicle_route
+```
+
+
+|字段|类型|说明|
+|-|-|-|
+|id|INTEGER||
+|solution_id|INTEGER||
+|vehicle_no|TEXT||
+|vehicle_type|INTEGER|4 或 6|
+|distance_meter|INTEGER||
+|duration_second|INTEGER||
+|cost|REAL||
+|polyline|TEXT|地图路径加密串|
+|valid|INTEGER|1 合格 / 0 超时或不可达|
+
+
+---
+
+# 9. 路线乘客关联表 route_passenger
+
+
+解决：多人车辆关系，记录每人的乘车明细与分摊。
+
+
+|字段|类型|说明|
+|-|-|-|
+|id|INTEGER||
+|route_id|INTEGER||
+|passenger_id|INTEGER||
+|sequence_no|INTEGER|接人顺序（1 起）|
+|direct_duration|INTEGER|起点直达终点秒数|
+|ride_duration|INTEGER|从本上车点到终点的实际乘车秒数|
+|increase_duration|INTEGER|ride - direct|
+|detour_ratio|REAL|ride / direct|
+|allocated_cost|REAL|本车分摊金额（已含尾差）|
+|warning|TEXT|null / DETOUR_WARNING|
+
+
+---
+
+# 五、API接口设计
+
+
+接口风格：
+
+RESTful。
+
+
+统一：
+
+```
+/api/v1
+```
+
+
+---
+
+# 六、任务创建接口
+
+
+## POST
+
+```
+/carpool/tasks
+```
+
+
+创建拼车任务。
+
+optimization_mode 取值：`cost`（最省钱，默认）/ `balanced`（平衡）/ `fewest_vehicles`（少车辆）。
+passengers 支持两种输入：
+- 坐标模式：传 lng/lat/coordinate（WGS84/GCJ02/BD09）
+- 地址模式：传 address 文本，后端走 geocoding 解析
+
+请求：
+
+```json
+{
+"name":"广州机场拼车",
+
+"destination":{
+"name":"机场",
+"lng":113.3,
+"lat":23.4
+},
+
+"optimization_mode":"cost",
+
+"passengers":[
+
+{
+"id":"001",
+"name":"张三",
+"lng":113.1,
+"lat":23.2,
+"coordinate":"GCJ02"
+},
+{
+"id":"002",
+"name":"李四",
+"address":"广州市越秀区北京路100号"
+}
+
+]
+}
+```
+
+
+返回：
+
+```json
+{
+"task_id":10001,
+
+"status":"CREATED"
+}
+```
+
+
+---
+
+# 七、启动优化接口
+
+
+## POST
+
+
+```
+/carpool/tasks/{id}/optimize
+```
+
+
+请求：
+
+```json
+{
+"budget":300
+}
+```
+
+
+返回：
+
+```json
+{
+"job_id":888,
+
+"status":"RUNNING"
+}
+```
+
+
+---
+
+# 八、查询优化状态
+
+
+GET
+
+
+```
+/optimization/jobs/{id}
+```
+
+
+返回：
+
+```json
+{
+"status":"OPTIMIZING",
+"sub_status":null,
+"stage":"optimizing",
+"progress":60,
+"best_cost":520.5,
+"iteration":350,
+"candidate_count":520,
+"eta_seconds":30
+}
+```
+
+
+---
+
+# 九、获取最终方案
+
+
+GET
+
+
+```
+/carpool/tasks/{id}/solution
+```
+
+
+返回：
+
+```json
+{
+"total_cost":520.5,
+"total_distance":85000,
+"total_duration":24000,
+"vehicle_count":8,
+"four_seat_count":2,
+"six_seat_count":6,
+"passenger_count":30,
+"allocated_count":30,
+"invalid_count":0,
+"longest_route_second":5100,
+"baseline_cost":780.0,
+"saving_ratio":0.33,
+"status":"COMPLETED",
+"job_status":"STOP_GAP",
+"gap":0.03,
+"elapsed_seconds":210,
+"vehicles":[]
+}
+```
+
+
+---
+
+# 九之二、获取逐人乘车明细接口（V1.1 新增）
+
+
+GET
+
+
+```
+/solutions/{id}/passengers
+```
+
+
+返回每位乘客的所属车辆、接人顺序、个人乘车明细、分摊金额、绕路预警：
+
+```json
+{
+"passengers":[
+{
+"passenger_id":1,
+"name":"张三",
+"vehicle_no":"V01",
+"sequence_no":1,
+"direct_duration":1500,
+"ride_duration":3300,
+"increase_duration":1800,
+"detour_ratio":2.2,
+"allocated_cost":33.34,
+"warning":"DETOUR_WARNING"
+}
+]
+}
+```
+
+
+---
+
+# 十、车辆详情接口
+
+
+GET
+
+
+```
+/solutions/{id}/vehicles
+```
+
+
+返回：
+
+```json
+{
+"vehicle":"V01",
+
+"type":6,
+
+"passengers":[
+"001",
+"002"
+],
+
+"route":[
+"A",
+"B",
+"终点"
+],
+
+"duration":3600,
+
+"cost":80
+}
+```
+
+
+---
+
+# 十一、地图路线接口
+
+
+GET
+
+
+```
+/routes/{id}/map
+```
+
+
+返回：
+
+```json
+{
+"polyline":"xxxxx",
+
+"distance":8200,
+
+"duration":1200
+}
+```
+
+
+---
+
+# 十二、任务实时进度 WebSocket
+
+
+用于前端等待页实时显示：
+
+```
+阶段 0：正在获取地图数据...（地址解析 + 矩阵生成）
+阶段 1：已生成 500 条候选路线，当前最佳费用 520 元
+阶段 2：优化中，已迭代 350 次，预计剩余 30 秒
+```
+
+
+连接：
+
+```
+/ws/task/{id}
+```
+
+
+消息体（V1.1 扩展）：
+
+```json
+{
+  "type": "stage" | "progress" | "best_cost" | "candidate_count" | "eta" | "done",
+  "stage": "INIT" | "FEASIBLE" | "OPTIMIZING",
+  "progress": 60,
+  "best_cost": 520.5,
+  "iteration": 350,
+  "candidate_count": 520,
+  "eta_seconds": 30,
+  "timestamp": "2026-10-12T15:30:00"
+}
+```
+
+
+---
+
+# 十三、算法调用（V1.1 同进程）
+
+V1.1 不再独立部署算法服务。FastAPI 进程内直接 import 算法模块，用 BackgroundTasks 异步执行。
+
+调用方式（Python 伪代码）：
+
+```python
+from optimizer import run_optimization
+
+@router.post("/carpool/tasks/{id}/optimize")
+def optimize(id: int, background_tasks: BackgroundTasks):
+    job_id = create_job(id)
+    background_tasks.add_task(run_optimization, job_id)
+    return {"job_id": job_id, "status": "QUEUED"}
+```
+
+并发限制：同时运行的优化任务数 ≤ max(1, CPU核数 - 2)，超过的任务 status=QUEUED。
+
+
+---
+
+# 十四、缓存设计（V1.1：内存 + SQLite，不用 Redis）
+
+## 地图矩阵缓存
+
+进程内 Python dict：
+```
+matrix_cache[(task_id, from_point, to_point)] = {"distance": 3000, "duration": 500}
+```
+
+持久化到 `map_matrix` 表，进程重启后从 SQLite 恢复。
+
+---
+
+## 优化状态缓存
+
+进程内 Python dict：
+```
+optimization_cache[job_id] = {"status": "OPTIMIZING", "best_cost": 520.5}
+```
+
+同步写 `optimization_job` 表，进程崩溃后从表里恢复状态。
+
+
+---
+
+# 十五、数据生命周期
+
+
+## 临时数据
+
+
+候选路线：
+
+保留：
+
+7天
+
+
+---
+
+## 永久数据
+
+
+保存：
+
+- 最终方案
+- 费用
+- 路线
+
+
+---
+
+# 十六、权限设计（V1.1：无登录）
+
+V1.1 是单机工具，不做用户体系、不做权限隔离。所有任务都在本机 SQLite 里，任何能打开页面的人都能查看全部任务。多用户隔离留到 V2.0。
+
+
+---
+
+# 十七、日志设计
+
+
+必须记录：
+
+## 算法日志
+
+```
+job_id
+
+iteration
+
+best_cost
+
+timestamp
+```
+
+
+## 地图日志
+
+```
+provider
+
+request
+
+response
+
+error
+```
+
+
+## 用户操作日志
+
+```
+create
+
+optimize
+
+export
+```
+
+
+---
+
+# 十八、V1.0最终技术架构
+
+
+```
+             前端
+
+              |
+              |
+
+          API服务
+
+              |
+
+       ----------------
+
+       |              |
+
+    MySQL          Redis
+
+
+       |
+
+  优化任务服务
+
+       |
+
+      ALNS算法
+
+       |
+
+   百度地图服务
+
+```
+
+
+---
+
+# 十九、V1.0开发优先级
+
+
+## P0 必须实现
+
+- 任务管理
+- 乘客管理
+- 百度地图矩阵
+- 候选路线池
+- ALNS优化
+- 最终方案
+- 费用计算
+- 路线展示
+
+
+## P1
+
+- 历史方案
+- 导出Excel
+- 分享链接
+- 司机版页面
+
+
+## P2
+
+- 多地图供应商
+- 动态路况
+- 实时司机调度
+
+
+---
+
+# 二十、最终建议
+
+到这里，这个项目已经形成完整链路：
+
+```
+业务需求
+ ↓
+技术方案
+ ↓
+数据库设计
+ ↓
+API设计
+ ↓
+研发实现
+```
+

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>百度地图覆盖物测试</title>
+<script type="text/javascript" src="https://api.map.baidu.com/api?v=3.0&ak=GyAoEPtKgtOFUvT2kdzgAYZIGZqUEAGV"></script>
+<style>
+  html, body, #map { width: 100%; height: 100%; margin: 0; padding: 0; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<script>
+  var map = new BMap.Map("map");
+  var point = new BMap.Point(113.75, 34.75);
+  map.centerAndZoom(point, 12);
+  map.enableScrollWheelZoom(true);
+
+  // 立刻画一个红色圆
+  var circle = new BMap.Circle(point, 2000, {
+    strokeColor: "red",
+    strokeWeight: 4,
+    fillColor: "red",
+    fillOpacity: 0.5
+  });
+  map.addOverlay(circle);
+
+  // 画一条蓝色线
+  var point2 = new BMap.Point(113.9, 34.75);
+  var line = new BMap.Polyline([point, point2], {
+    strokeColor: "blue",
+    strokeWeight: 6
+  });
+  map.addOverlay(line);
+
+  console.log("覆盖物已添加");
+</script>
+</body>
+</html>
