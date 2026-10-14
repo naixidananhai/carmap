@@ -234,6 +234,11 @@ class AmapClient:
         """
         地址 → (lng, lat)，**GCJ-02** 坐标（高德原生坐标系）。
         若项目需要 BD09，请用 bd09_from_amap() 转换。
+
+        city 仅作为「检索偏好」而非硬限制：高德 city 参数会拒绝跨市结果
+        （实测「河南博物院」实际在开封，传 city=郑州市 直接无结果）。
+        因此策略是——先按 city 检索，无结果再放宽到全国，最后用
+        province/city 字段做合理性提示（供调用方决定是否采信）。
         """
         cache_key = ("geo", address, city)
         if cache_key in self.cache:
@@ -242,13 +247,35 @@ class AmapClient:
         if city:
             params["city"] = city
         data = self._request(GEOCODE_PATH, params)
+        loc = self._extract_loc(data)
+        if loc is None and city:
+            # city 限定下无结果（多为跨市地址），放宽到全国再试一次
+            data = self._request(GEOCODE_PATH, {"address": address})
+            loc = self._extract_loc(data)
+            if loc is not None:
+                city_used = "全国（city 限定无结果，已放宽）"
+            else:
+                city_used = None
+        else:
+            city_used = city
+        if loc is None:
+            return None
+        out = (loc[0], loc[1])
+        self.cache[cache_key] = out
+        self.last_geocode_city = city_used
+        return out
+
+    @staticmethod
+    def _extract_loc(data: Optional[dict]) -> Optional[Tuple[float, float]]:
+        """从 geocode 响应中取出首个 location，转为 (lng, lat)。"""
         if data and data.get("geocodes"):
-            loc = data["geocodes"][0].get("location", "")
-            if "," in loc:
-                lng, lat = loc.split(",", 1)
-                out = (float(lng), float(lat))
-                self.cache[cache_key] = out
-                return out
+            raw = data["geocodes"][0].get("location", "")
+            if "," in raw:
+                lng, lat = raw.split(",", 1)
+                try:
+                    return (float(lng), float(lat))
+                except ValueError:
+                    return None
         return None
 
     # ---------- 单条驾车路线（含折线） ----------

@@ -41,8 +41,9 @@ class BaseProvider:
         """单条驾车路线。返回 (距离m, 耗时s, [(lng,lat), ...])，失败 None。"""
         raise NotImplementedError
 
-    def geocode(self, address: str) -> Optional[Tuple[float, float]]:
-        """地址 -> (lng, lat)（BD09）。"""
+    def geocode(self, address: str, city: Optional[str] = None
+                ) -> Optional[Tuple[float, float]]:
+        """地址 -> (lng, lat)（BD09）。city 为城市限定，用于排除同名地标。"""
         return None
 
     def is_usable(self) -> bool:
@@ -70,8 +71,8 @@ class AmapProvider(BaseProvider):
     def driving_route(self, o_lat, o_lng, d_lat, d_lng):
         return self.client.driving_route_bd09(o_lat, o_lng, d_lat, d_lng)
 
-    def geocode(self, address):
-        r = self.client.geocode(address)
+    def geocode(self, address, city=None):
+        r = self.client.geocode(address, city)
         if not r:
             return None
         from amap_map import gcj02_to_bd09
@@ -99,7 +100,7 @@ class BaiduProvider(BaseProvider):
     def driving_route(self, o_lat, o_lng, d_lat, d_lng):
         return self.client.driving_route(o_lat, o_lng, d_lat, d_lng)
 
-    def geocode(self, address):
+    def geocode(self, address, city=None):
         return self.client.geocode(address)
 
 

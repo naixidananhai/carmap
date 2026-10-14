@@ -13,7 +13,7 @@ import uuid
 import time
 from typing import List, Optional
 from pydantic import BaseModel
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from optimizer import Passenger, DistanceMatrix, optimize
@@ -263,6 +263,41 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/api/geocode", response_model=dict)
+def api_geocode(address: str = Query(..., min_length=1), city: str = "郑州市"):
+    """
+    地址检索代理。
+
+    为什么必须由后端转发：前端的地图 Key 是「Web端(JS API)」类型，
+    而高德 JS SDK 内置的 Geocoder 在服务端侧仍以 Web服务 身份调用接口，
+    会被判定为 USERKEY_PLAT_NOMATCH 而永不回调（实测页面卡在"检索中..."）。
+    高德两类 Key 严格隔离，因此地理编码只能走后端持有的「Web服务」Key。
+
+    city 为必填并强制生效：高德在 city 缺失或无法识别时会把同名地标
+    解析到其他城市（实测「二七广场」被解析到天津），必须限定城市。
+
+    返回坐标为 **BD09**，与项目其余部分（/api/tasks、折线数据）一致，
+    前端无需再转换一次。
+    """
+    provider, name = create_provider()
+    city = (city or "").strip() or "郑州市"
+    try:
+        loc = provider.geocode(address, city)
+    except TypeError:
+        # provider.geocode 只有一个参数（部分实现），退回不带城市的方式
+        try:
+            loc = provider.geocode(address)
+        except Exception as e:
+            print(f"[geocode] 调用失败: {e}")
+            loc = None
+    except Exception as e:
+        print(f"[geocode] 调用失败: {e}")
+        loc = None
+    if loc is None:
+        return {"ok": False, "error": "地理编码服务不可用"}
+    return {"ok": True, "lng": loc[0], "lat": loc[1], "source": name}
 
 
 @app.post("/api/tasks", response_model=dict)

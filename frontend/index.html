@@ -4,7 +4,19 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>拼车路线优化系统</title>
-<script type="text/javascript" src="https://api.map.baidu.com/api?v=3.0&ak=GyAoEPtKgtOFUvT2kdzgAYZIGZqUEAGV"></script>
+<!--
+  高德地图 JS API 2.0（Web端）
+  Key 为浏览器端密钥，按设计本就随页面公开，风险远低于服务端 SK。
+  建议在高德控制台为该 Key 配置 referer / 域名白名单，避免被他人盗刷配额。
+
+  重要：不要用 AMap.Geocoder 做地址检索。JS SDK 内置的 Geocoder 在服务端侧
+  仍以 Web服务 身份调用，会被判 USERKEY_PLAT_NOMATCH 而永不回调。
+  高德「Web端(JS)」与「Web服务」两类 Key 严格隔离，
+  因此地址检索统一走本项目后端 /api/geocode（用 Web服务 Key，返回 BD09）。
+
+  地图渲染、点击选点、折线绘制只用 JS API 本身，无需 Geocoder 插件。
+-->
+<script type="text/javascript" src="https://webapi.amap.com/maps?v=2.0&key=c504fdc836c58e69a8be4222e442ea32&plugin=AMap.Scale,AMap.ToolBar"></script>
 <style>
   body { margin: 0; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f5f7fa; }
   .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
@@ -231,7 +243,6 @@ let map = null;
 let pickMap = null;
 let destPoint = null;
 let destMarker = null;
-let geocoder = null;
 let elapsedTimer = null;
 let currentDirection = 'pickup';
 let currentResult = null;
@@ -239,35 +250,109 @@ let visibleVehicles = new Set();
 let passengers = [];       // {name, address, lat, lng, status: ok|fail|''}
 let geoQueue = Promise.resolve();
 
+// ---------- 坐标系转换 ----------
+// 后端对外统一使用 BD09（百度坐标），高德底图使用 GCJ-02（火星坐标），
+// 两者在郑州一带相差约 700 米，若直接混用会导致标记与道路整体错位。
+// 因此约定：内存里一律存 BD09，只在与高德地图交互时转换为 GCJ-02。
+const COORD_PI = 3.1415926535897932384626;
+const COORD_A = 0.0000066934076227;
+const COORD_EE = 0.0066943799901413165;
+
+function transformLat(lng, lat) {
+  let ret = -100.0 + 2.0 * lng + 3.0 * lat + 0.2 * lat * lat + 0.1 * lng * lat +
+            0.2 * Math.sqrt(Math.abs(lng));
+  ret += (20.0 * Math.sin(6.0 * lng * COORD_PI) + 20.0 * Math.sin(2.0 * lng * COORD_PI)) * 2.0 / 3.0;
+  ret += (20.0 * Math.sin(lat * COORD_PI) + 40.0 * Math.sin(lat / 3.0 * COORD_PI)) * 2.0 / 3.0;
+  ret += (160.0 * Math.sin(lat / 12.0 * COORD_PI) + 320 * Math.sin(lat * COORD_PI / 30.0)) * 2.0 / 3.0;
+  return ret;
+}
+function transformLng(lng, lat) {
+  let ret = 300.0 + lng + 2.0 * lat + 0.1 * lng * lng + 0.1 * lng * lat +
+            0.1 * Math.sqrt(Math.abs(lng));
+  ret += (20.0 * Math.sin(6.0 * lng * COORD_PI) + 20.0 * Math.sin(2.0 * lng * COORD_PI)) * 2.0 / 3.0;
+  ret += (20.0 * Math.sin(lng * COORD_PI) + 40.0 * Math.sin(lng / 3.0 * COORD_PI)) * 2.0 / 3.0;
+  ret += (150.0 * Math.sin(lng / 12.0 * COORD_PI) + 300.0 * Math.sin(lng / 30.0 * COORD_PI)) * 2.0 / 3.0;
+  return ret;
+}
+/** BD09 -> GCJ-02（正向，官方标准公式）。入参出参均为 [lng, lat] */
+function bd09ToGcj02(lng, lat) {
+  const x = lng - 0.0065, y = lat - 0.006;
+  const z = Math.sqrt(x * x + y * y) - 0.00002 * Math.sin(y * COORD_PI);
+  const theta = Math.atan2(y, x) - 0.000003 * Math.cos(x * COORD_PI);
+  return [z * Math.cos(theta), z * Math.sin(theta)];
+}
+/** GCJ-02 -> BD09（反向近似，误差 1~2 米）。入参出参均为 [lng, lat] */
+function gcj02ToBd09(lng, lat) {
+  const z = Math.sqrt(lng * lng + lat * lat) + 0.00002 * Math.sin(lat * COORD_PI);
+  const theta = Math.atan2(lat, lng) + 0.000003 * Math.cos(lng * COORD_PI);
+  return [z * Math.cos(theta) + 0.0065, z * Math.sin(theta) + 0.006];
+}
+/** 高德地图交互得到的 GCJ-02 点 -> 内部使用的 BD09 [lng, lat] */
+function gcjToBd(pt) { return gcj02ToBd09(pt.lng, pt.lat); }
+
 // ---------- 地图 ----------
 function initBaseMap() {
-  map = new BMap.Map('map');
-  map.centerAndZoom(new BMap.Point(113.70, 34.74), 11);
-  map.enableScrollWheelZoom(true);
-  map.addControl(new BMap.NavigationControl());
-  map.addControl(new BMap.ScaleControl());
-  try { map.addControl(new BMap.FullScreenControl()); } catch(e) {}
+  if (typeof AMap === 'undefined') {
+    showErr('高德地图 JS API 加载失败，请检查网络或 Key 配置');
+    return;
+  }
+  map = new AMap.Map('map', {
+    // 高德底图为 GCJ-02，中心坐标必须是转换后的值
+    zoom: 11, center: bd09ToGcj02(113.70, 34.74), viewMode: '2D',
+    resizeEnable: true
+  });
+  // 控件为可选插件：未就绪时跳过，不应让整段初始化失败
+  if (AMap.Scale) map.addControl(new AMap.Scale());
+  if (AMap.ToolBar) map.addControl(new AMap.ToolBar({ position: 'LT' }));
 }
 
 function initPickMap() {
-  geocoder = new BMap.Geocoder();
-  pickMap = new BMap.Map('pick_map');
-  pickMap.centerAndZoom(new BMap.Point(113.7536, 34.7421), 13);
-  setDestPoint(new BMap.Point(113.7536, 34.7421), true);
-  pickMap.addEventListener('click', function(e) { setDestPoint(e.point); });
+  if (typeof AMap === 'undefined' || pickMap) return;
+  // 高德底图是 GCJ-02，初始中心必须用转换后的坐标，
+  // 直接填 BD09 数值会让视野偏移约 700m（标记与底图错位）
+  const initGcj = bd09ToGcj02(113.7536, 34.7421);
+  pickMap = new AMap.Map('pick_map', {
+    zoom: 13, center: initGcj, viewMode: '2D', resizeEnable: true
+  });
+  pickMap.on('click', function (e) {
+    const bd = gcjToBd(e.lnglat);
+    setDestPoint(bd[0], bd[1]);
+  });
+  setDestPoint(113.7536, 34.7421, true);
 }
 
-function setDestPoint(pt, silent) {
-  destPoint = pt;
-  if (destMarker) { destMarker.setPosition(pt); }
-  else {
-    destMarker = new BMap.Marker(pt, { enableDragging: true });
-    destMarker.addEventListener('dragend', function() { setDestPoint(destMarker.point); });
-    pickMap.addOverlay(destMarker);
+// lng / lat 均为 BD09
+function setDestPoint(lng, lat, silent) {
+  destPoint = { lng: lng, lat: lat };
+  const gcj = bd09ToGcj02(lng, lat);
+  if (destMarker) {
+    destMarker.setPosition(gcj);
+  } else {
+    destMarker = new AMap.Marker({ position: gcj, draggable: true, cursor: 'move' });
+    destMarker.on('dragend', function (e) {
+      const bd = gcjToBd(e.lnglat);
+      setDestPoint(bd[0], bd[1], true);
+    });
+    pickMap.add(destMarker);
   }
-  if (!silent) pickMap.panTo(pt);
+  if (!silent) pickMap.setCenter(gcj);
   document.getElementById('dest_coord').textContent =
-      pt.lat.toFixed(4) + ', ' + pt.lng.toFixed(4);
+      lat.toFixed(4) + ', ' + lng.toFixed(4);
+}
+
+/**
+ * 地址检索（走后端代理）
+ * 不用 AMap.Geocoder：JS Key 与 Web服务 Key 平台类型隔离，
+ * SDK 内置 Geocoder 会因 USERKEY_PLAT_NOMATCH 永不回调。
+ * 后端返回的已是 BD09，与内部存储一致，无需转换。
+ */
+async function lookupAddress(address) {
+  const resp = await fetch('/api/geocode?address=' + encodeURIComponent(address) +
+                          '&city=' + encodeURIComponent('郑州市'));
+  if (!resp.ok) throw new Error('HTTP ' + resp.status);
+  const data = await resp.json();
+  if (!data.ok) throw new Error(data.error || '地理编码服务不可用');
+  return data;
 }
 
 function geocodeDest() {
@@ -276,17 +361,16 @@ function geocodeDest() {
   const tag = document.getElementById('dest_status');
   tag.className = 'status-tag st-wait';
   tag.textContent = '检索中...';
-  geocoder.getPoint(addr, function(pt) {
-    if (pt) {
-      setDestPoint(pt);
-      tag.className = 'status-tag st-ok';
-      tag.textContent = '已定位';
-      hideErr();
-    } else {
-      tag.className = 'status-tag st-fail';
-      tag.textContent = '未找到该地址';
-    }
-  }, '郑州市');
+  lookupAddress(addr).then(data => {
+    setDestPoint(data.lng, data.lat);
+    tag.className = 'status-tag st-ok';
+    tag.textContent = '已定位';
+    hideErr();
+  }).catch(e => {
+    tag.className = 'status-tag st-fail';
+    tag.textContent = '未找到该地址';
+    console.error('地址检索失败', e);
+  });
 }
 
 // ---------- 模式 ----------
@@ -357,15 +441,17 @@ function geocodeRow(i) {
     setRowStatus(i); updateRowsCount(); return;
   }
   p.status = 'wait'; setRowStatus(i);
-  // 串行队列，避免并发触发百度 QPS 限制
-  geoQueue = geoQueue.then(() => new Promise(resolve => {
-    geocoder.getPoint(p.address, function(pt) {
-      if (pt) { p.lat = pt.lat; p.lng = pt.lng; p.status = 'ok'; }
-      else { p.lat = p.lng = null; p.status = 'fail'; }
-      setRowStatus(i); updateRowsCount();
-      resolve();
-    }, '郑州市');
-  }));
+  // 串行队列，避免并发打满后端与地图服务的 QPS
+  geoQueue = geoQueue.then(() => lookupAddress(p.address).then(data => {
+    // 后端已返回 BD09，与内部存储一致
+    p.lat = data.lat; p.lng = data.lng;
+    p.status = 'ok';
+  }).catch(e => {
+    p.lat = p.lng = null; p.status = 'fail';
+    console.error('地址解析失败:', p.address, e);
+  })).then(() => {
+    setRowStatus(i); updateRowsCount();
+  });
 }
 
 function updateRowsCount() {
@@ -658,20 +744,12 @@ function exportCSV() {
 }
 
 // ---------- 地图绘制 ----------
-function makeIcon(shape, color, scale) {
-  const shapeConst = shape === 'star' ? BMap.Symbol_BMAP_SHAPE_STAR5 : BMap.Symbol_BMAP_SHAPE_CIRCLE;
-  return new BMap.Symbol(shapeConst, {
-    scale: scale, fillColor: color, fillOpacity: 0.95,
-    strokeColor: '#ffffff', strokeWeight: 1.5
-  });
-}
-
 function renderMap() {
   if (!map || !currentResult) return;
-  map.clearOverlays();
+  map.clearMap();
   const allPoints = [];
-  const symbolOk = typeof BMap.Symbol === 'function' && typeof BMap.Symbol_BMAP_SHAPE_STAR5 !== 'undefined';
   const isDrop = currentResult.direction === 'dropoff';
+  const overlays = [];
 
   currentResult.vehicles.forEach((v, vIdx) => {
     if (!visibleVehicles.has(vIdx)) return;
@@ -679,35 +757,62 @@ function renderMap() {
     const coords = v.coordinates;
     if (!coords || coords.length === 0) return;
 
+    // 折线：优先真实路网（后端返回 BD09），否则退化为站点直线
     const pathCoords = (v.path && v.path.length > 1) ? v.path : coords;
-    const points = pathCoords.map(c => new BMap.Point(c.lng, c.lat));
-    allPoints.push(...points);
-    map.addOverlay(new BMap.Polyline(points, {
-      strokeColor: color, strokeWeight: 5, strokeOpacity: 0.85
-    }));
+    const path = pathCoords.map(c => bd09ToGcj02(c.lng, c.lat));
+    allPoints.push(...path);
+    const line = new AMap.Polyline({
+      path: path, strokeColor: color, strokeWeight: 5, strokeOpacity: 0.85,
+      lineJoin: 'round', showDir: false
+    });
+    map.add(line);
+    overlays.push(line);
 
     coords.forEach((c, i) => {
-      const pt = new BMap.Point(c.lng, c.lat);
+      const gcj = bd09ToGcj02(c.lng, c.lat);
       const isDest = isDrop ? (i === 0) : (i === coords.length - 1);
       const ptColor = isDest ? '#f56c6c' : color;
-      if (symbolOk) {
-        const icon = makeIcon(isDest ? 'star' : 'circle', ptColor, isDest ? 14 : 9);
-        map.addOverlay(new BMap.Marker(pt, { icon: icon }));
+
+      if (isDest) {
+        // 活动点/终点用圆形大点强调
+        const dot = new AMap.CircleMarker({
+          position: gcj, radius: 9, strokeColor: '#ffffff', strokeWeight: 2,
+          fillColor: ptColor, fillOpacity: 0.95, cursor: 'pointer'
+        });
+        map.add(dot); overlays.push(dot);
       } else {
-        map.addOverlay(new BMap.Circle(pt, isDest ? 500 : 250, {
-          strokeColor: ptColor, strokeWeight: 2, fillColor: ptColor, fillOpacity: 0.7
-        }));
+        const dot = new AMap.CircleMarker({
+          position: gcj, radius: 6, strokeColor: '#ffffff', strokeWeight: 2,
+          fillColor: ptColor, fillOpacity: 0.95, cursor: 'pointer'
+        });
+        map.add(dot); overlays.push(dot);
       }
-      const label = new BMap.Label(c.name, { offset: new BMap.Size(10, -12) });
-      label.setStyle({
-        backgroundColor: ptColor, color: '#fff', borderRadius: '4px',
-        padding: '2px 6px', border: 'none', fontSize: '12px', fontWeight: 'bold'
+
+      // 文字标签
+      const label = new AMap.Text({
+        text: c.name,
+        position: [gcj[0], gcj[1]],
+        offset: new AMap.Pixel(10, -10),
+        anchor: 'left-center',
+        style: {
+          'background-color': ptColor,
+          'color': '#fff',
+          'border-radius': '4px',
+          'padding': '2px 6px',
+          'border': 'none',
+          'font-size': '12px',
+          'font-weight': 'bold',
+          'white-space': 'nowrap'
+        }
       });
-      label.setPosition(pt);
-      map.addOverlay(label);
+      map.add(label); overlays.push(label);
     });
   });
-  if (allPoints.length > 0) map.setViewport(allPoints);
+
+  // 自适应视野（留出边距，避免标记贴边）
+  if (allPoints.length > 0) {
+    map.setFitView(overlays.filter(o => !(o instanceof AMap.Text)), false, [60, 60, 60, 60], 16);
+  }
 }
 
 function renderLegend() {
@@ -741,6 +846,13 @@ function initMap(result) {
   visibleVehicles = new Set(result.vehicles.map((_, i) => i));
   renderLegend();
   renderMap();
+  // 地图容器初始为 display:none，显示后尺寸才有效，必须手动 resize + 重算视野，
+  // 否则高德会按 0x0 布局，表现为"地图空白/瓦片不加载"
+  requestAnimationFrame(() => {
+    if (!map) return;
+    map.resize();
+    renderMap();
+  });
 }
 
 // ---------- 事件绑定 ----------
@@ -774,11 +886,17 @@ document.getElementById('csv_export_btn').addEventListener('click', exportCSV);
 
 document.getElementById('btn_fullscreen').addEventListener('click', () => {
   const card = document.getElementById('map_card');
-  if (!document.fullscreenElement) {
-    (card.requestFullscreen || card.webkitRequestFullscreen).call(card);
-  } else {
-    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
-  }
+  const target = document.fullscreenElement ? document : card;
+  const fn = target.requestFullscreen || target.webkitRequestFullscreen;
+  if (!fn) { showErr('当前浏览器不支持全屏'); return; }
+  fn.call(target).then(() => {
+    // 高德地图不会随容器尺寸变化自动重绘，进/出全屏都要手动触发
+    setTimeout(() => { if (map) map.resize(); }, 220);
+  }).catch(e => showErr('无法进入全屏: ' + e.message));
+});
+
+document.addEventListener('fullscreenchange', () => {
+  if (map) setTimeout(() => map.resize(), 220);
 });
 
 document.getElementById('btn_select_all').addEventListener('click', () => {
@@ -804,10 +922,47 @@ if (location.protocol === 'file:') {
   bar.innerHTML = '页面是通过本地文件（file://）打开的，无法连接后端服务。' +
     '请在浏览器地址栏输入 <b>http://localhost:8000/</b> 访问（需先启动后端）。';
 }
-initBaseMap();
-initPickMap();
-setDirection('pickup');
-loadDemo();
+
+function boot() {
+  // 每一步独立兜底：地图初始化失败不应连带影响名单加载等功能
+  try { initBaseMap(); } catch (e) { console.error('主地图初始化失败', e); }
+  try { initPickMap(); } catch (e) { console.error('选点地图初始化失败', e); }
+  try { setDirection('pickup'); } catch (e) { console.error(e); }
+  try { loadDemo(); } catch (e) { console.error('示例名单加载失败', e); }
+}
+
+// 高德 plugin 参数是异步注入的：AMap 主体先就绪，Scale/ToolBar 稍后才可用。
+// 因此等 plugin 回调再启动；同时留一个超时兜底，避免插件加载失败时页面完全空白。
+(function start() {
+  if (typeof AMap === 'undefined') {
+    // JS API 尚未到达（网络慢或被拦截），轮询等待
+    let tries = 0;
+    const timer = setInterval(() => {
+      tries++;
+      if (typeof AMap !== 'undefined') { clearInterval(timer); waitPlugin(); }
+      else if (tries > 50) {
+        clearInterval(timer);
+        showErr('高德地图 JS API 加载超时，请检查网络连接或 Key 配置');
+      }
+    }, 200);
+    return;
+  }
+  waitPlugin();
+})();
+
+function waitPlugin() {
+  if (AMap.plugin) {
+    // Scale / ToolBar 由高德异步注入，需等回调后再挂控件。
+    // 注意不要加 AMap.Geocoder：SDK 的 Geocoder 在本项目不可用（见文件头说明）
+    AMap.plugin(['AMap.Scale', 'AMap.ToolBar'], function () {
+      boot();
+    });
+    // 插件回调超时兜底：即使 plugin 未回调也先把基础功能启动起来
+    setTimeout(() => { if (!pickMap && !map) boot(); }, 5000);
+  } else {
+    boot();
+  }
+}
 </script>
 </body>
 </html>
