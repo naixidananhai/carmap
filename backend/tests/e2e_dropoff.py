@@ -65,14 +65,28 @@ dest = Passenger(id="DEST", name="活动点", lat=DEST[0], lng=DEST[1])
 ps = [Passenger(id=f"P{i+1:03d}", name=n, lat=la, lng=ln) for i, (n, la, ln) in enumerate(PASSENGERS)]
 idx_map = {p.id: i for i, p in enumerate(ps)}
 dest_idx = len(ps)
+all_points = [(p.lat, p.lng) for p in ps] + [DEST]
 
-# 原始矩阵 M[i][j] = i→j 的折线（保持正向，不转置）
-M = [[None] * (len(ps) + 1) for _ in range(len(ps) + 1)]
-M[dest_idx][1] = [(113.72, 34.755), (113.73, 34.752)]   # 活动点 -> 李四
-M[1][0] = [(113.66, 34.752), (113.65, 34.748)]          # 李四 -> 张三
+# 用假 provider 注入已知折线：P[i][j] = i→j 的折线（保持正向，不转置）
+# provider.driving_route(o_lat, o_lng, d_lat, d_lng) -> (距离, 耗时, 折线)
+# 注意坐标传入顺序为 (lat, lng)，而折线点为 (lng, lat)
+class FakeProvider:
+    P = {}
+    def driving_route(self, o_lat, o_lng, d_lat, d_lng):
+        key = (round(o_lat, 6), round(o_lng, 6), round(d_lat, 6), round(d_lng, 6))
+        pts = self.P.get(key)
+        if pts is None:
+            return None
+        return (1000.0, 60.0, pts)
+
+fake = FakeProvider()
+# 活动点 -> 李四
+fake.P[(DEST[0], DEST[1], PASSENGERS[1][1], PASSENGERS[1][2])] = [(113.72, 34.755), (113.73, 34.752)]
+# 李四 -> 张三
+fake.P[(PASSENGERS[1][1], PASSENGERS[1][2], PASSENGERS[0][1], PASSENGERS[0][2])] = [(113.66, 34.752), (113.65, 34.748)]
 
 stops = [dest, ps[1], ps[0]]   # 送人顺序：活动点 -> 李四 -> 张三
-pts = build_vehicle_path(stops, idx_map, dest_idx, M)
+pts = build_vehicle_path(fake, stops, idx_map, dest_idx, all_points)
 check(len(pts) > 0, "散场 stops 序列能取到路径段")
 check(pts[0] == (DEST[1], DEST[0]), f"首点为活动点精确坐标 {pts[0]}")
 check(pts[-1] == (ps[0].lng, ps[0].lat), f"末点为最后住宿点精确坐标 {pts[-1]}")

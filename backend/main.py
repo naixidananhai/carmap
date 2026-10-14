@@ -17,7 +17,7 @@ from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 
 from optimizer import Passenger, DistanceMatrix, optimize
-from baidu_map import BaiduMapClient
+from map_provider import create_provider
 
 app = FastAPI(title="拼车路线优化系统", version="1.1")
 
@@ -90,14 +90,19 @@ class TaskResult(BaseModel):
 
 
 # ============ 后台优化任务 ============
-def build_vehicle_path(stops, idx_map, dest_idx, path_matrix):
+def build_vehicle_path(provider, stops, idx_map, dest_idx, all_points):
     """
     按接人顺序拼接一辆车的真实路网折线。
+
+    设计要点（P0 性能优化）：
+    矩阵构建阶段**不再预取折线**——预取要为 N² 个点对各发一次请求，
+    而求最优解只需要距离；最终方案用到的折线极少（车辆数 × 段数）。
+    因此这里按需逐段调用 provider.driving_route()（provider 内部有缓存，
+    同一段重复取不会重复计费）。
+
     stops: [Passenger, ..., dest]（dest.id == "DEST"）
     返回 [(lng, lat), ...]；任一段无路径数据时返回 []（前端降级为直线）
     """
-    if not path_matrix:
-        return []
     pts = []
     for k in range(1, len(stops)):
         prev, cur = stops[k - 1], stops[k]
@@ -105,7 +110,11 @@ def build_vehicle_path(stops, idx_map, dest_idx, path_matrix):
         j = dest_idx if cur.id == "DEST" else idx_map.get(cur.id)
         if i is None or j is None:
             return []
-        seg = path_matrix[i][j]
+        res = provider.driving_route(all_points[i][0], all_points[i][1],
+                                     all_points[j][0], all_points[j][1])
+        if not res:
+            return []
+        seg = res[2]
         if not seg:
             return []
         # 段与段首尾相接，去掉重复的连接点
@@ -143,30 +152,30 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
             ))
         dest = Passenger(id="DEST", name="终点", lat=dest_lat, lng=dest_lng)
 
-        # 构建距离矩阵（先试百度，失败用 Haversine）
+        # 构建距离矩阵（provider 内部处理坐标转换与降级）
+        # 注意：不再预取折线，折线在结果阶段按需补取（见 build_vehicle_path）
         all_points = [(p.lat, p.lng) for p in passengers] + [(dest.lat, dest.lng)]
-        baidu = BaiduMapClient()
+        provider, provider_name = create_provider()
+        TASKS[task_id]["provider"] = provider_name
         baidu_matrix = None
-        path_matrix = None  # path_matrix[i][j] = [(lng, lat), ...] 真实路网折线点
         try:
-            print(f"[任务 {task_id}] 调用百度地图距离矩阵...")
-            baidu_matrix, path_matrix = baidu.build_full_matrix(all_points)
+            print(f"[任务 {task_id}] 构建距离矩阵（{provider_name}）...")
+            baidu_matrix = provider.build_matrix(all_points)
             # 检查是否全 None（调用失败）
             if all(baidu_matrix[i][j] is None for i in range(len(all_points)) for j in range(len(all_points)) if i != j):
-                print(f"[任务 {task_id}] 百度矩阵全空，降级到 Haversine")
+                print(f"[任务 {task_id}] {provider_name} 矩阵全空，降级到 Haversine")
                 baidu_matrix = None
-                path_matrix = None
         except Exception as e:
-            print(f"[任务 {task_id}] 百度矩阵调用异常: {e}，降级到 Haversine")
+            print(f"[任务 {task_id}] {provider_name} 矩阵调用异常: {e}，降级到 Haversine")
             baidu_matrix = None
-            path_matrix = None
 
         # 散场模式：距离矩阵转置。D'(i,j) = D(j,i)，
         # 在转置矩阵上按「接人」语义求解，数学上等价于在原矩阵上
         # 优化「从活动点出发依次送达各住宿点」，optimizer.py 零改动。
-        # 注意 1：path_matrix 不转置——折线有方向性（单行道正向/反向不是一条路），
-        # 输出反转后段段取原始正向折线 M[上一站][下一站] 即可。
-        # 注意 2：必须在创建 DistanceMatrix 之前转置，否则 dm 持原始引用、优化跑错方向
+        # 折线不在矩阵里（结果阶段按需取），取的时候直接按「上一站→下一站」
+        # 的原始正向查询即可，无需特殊处理——provider 的 driving_route
+        # 始终返回 A→B 的正向折线，与矩阵方向无关。
+        # 注意：必须在创建 DistanceMatrix 之前转置，否则 dm 持原始引用、优化跑错方向
         is_dropoff = (direction == "dropoff")
         fwd_matrix = baidu_matrix  # 转置前的原始矩阵：leg_durations 用正向段的耗时
         if is_dropoff:
@@ -200,8 +209,8 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
             else:
                 coords.append(venue_coord)
                 stops = seq + [dest]
-            # 拼接沿真实路网的折线（任一段缺失则返回空，前端降级为直线）
-            path_pts = build_vehicle_path(stops, idx_map, dest_idx, path_matrix)
+            # 按需拼接沿真实路网的折线（provider 内部有缓存，重复段不重复计费）
+            path_pts = build_vehicle_path(provider, stops, idx_map, dest_idx, all_points)
             # 每段耗时（分钟），与 coordinates 顺序对应，供前端时间线累加。
             # 散场时 fwd_matrix 是转置前的原始矩阵——转置矩阵的段是反向边，耗时不符
             legs = []
