@@ -349,6 +349,38 @@ def main():
         if not done:
             return
 
+        # A8：前端要能看到 8 态作业状态（进度卡片的状态标签 + 结果卡片的状态脚注）
+        a8 = evaluate(send, """(() => ({
+          tag: document.getElementById('job_status_tag').textContent,
+          tagTitle: document.getElementById('job_status_tag').title,
+          statusText: document.getElementById('job_status_text').textContent,
+          bar: document.getElementById('job_bar').style.width,
+          note: (document.querySelector('#vehicles_list p') || {}).textContent || ''
+        }))()""") or {}
+        check("进度卡片展示了 8 态作业状态（已收敛/预算用尽等）",
+              a8.get("tag") in ("准备中", "已找到可行解", "优化中", "提前收敛",
+                                "预算用尽", "已收敛", "全局最优", "未找到可行方案"),
+              f'{a8.get("tag")!r} / {a8.get("tagTitle")!r}')
+        check("终止原因文案已回显", bool(a8.get("statusText")),
+              str(a8.get("statusText"))[:60])
+        check("进度条走完（100%）", a8.get("bar") == "100%", str(a8.get("bar")))
+        check("结果卡片带求解状态脚注（含 gap）",
+              "求解状态" in (a8.get("note") or "") and "下界" in (a8.get("note") or ""),
+              (a8.get("note") or "")[:90])
+
+        # A7：任务与结果已写穿 SQLite（前端不需刷新即可被别的客户端读到）
+        import urllib.request as _url
+        tid = evaluate(send, "typeof TASK_ID !== 'undefined' ? TASK_ID : null")
+        if tid:
+            with _url.urlopen(f"http://localhost:8000/api/tasks/{tid}") as resp:
+                import json as _json
+                saved = _json.loads(resp.read().decode("utf-8"))
+            check("结果已持久化到 SQLite（job_status/terminal 可查）",
+                  saved.get("job_status") in ("STOP_GAP", "STOP_TIMEOUT", "STOP_STABLE",
+                                              "OPTIMAL", "FAILED")
+                  and saved.get("terminal") is True,
+                  f'{saved.get("job_status")} / terminal={saved.get("terminal")}')
+
         time.sleep(4)
         res = evaluate(send, """(() => {
           const r = currentResult;

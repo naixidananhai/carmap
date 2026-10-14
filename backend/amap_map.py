@@ -44,6 +44,50 @@ _THROTTLE_CODES = ("CUQPS_HAS_EXCEEDED_THE_LIMIT", "CUQPS_OVER_LIMIT",
                    "DAILY_QUERY_OVER_LIMIT", "QPS_HAS_EXCEEDED_THE_LIMIT",
                    "QUOTA", "FLOW", "RATE_LIMIT")
 
+# A7：距阵点对缓存落到 SQLite（map_matrix 表），跨任务复用、进程重启后仍生效。
+# 数据库不可用时静默降级为「无缓存」，绝不影响主流程。
+PROVIDER_NAME = "amap"
+
+
+def _cache_load(points_bd09: List[Tuple[float, float]], matrix) -> int:
+    """
+    用 SQLite 的 map_matrix 预填矩阵，返回命中数。
+    键为 BD09 的定点坐标串，因此同一批地址在不同任务之间可以复用。
+    """
+    try:
+        import db
+    except Exception:  # noqa: BLE001
+        return 0
+    n = len(points_bd09)
+    pairs = [(points_bd09[i][0], points_bd09[i][1],
+              points_bd09[j][0], points_bd09[j][1])
+             for i in range(n) for j in range(n) if i != j]
+    try:
+        hits = db.matrix_lookup(PROVIDER_NAME, pairs)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [矩阵缓存] 读取失败，忽略缓存：{e}")
+        return 0
+    k = 0
+    for idx, (i, j) in enumerate([(i, j) for i in range(n) for j in range(n) if i != j]):
+        hit = hits[idx] if idx < len(hits) else None
+        if hit is None:
+            continue
+        matrix[i][j] = (float(hit[0]), float(hit[1]))
+        k += 1
+    return k
+
+
+def _cache_save(rows) -> None:
+    """把本次新取到的点对写回 SQLite（失败只打印，不影响返回结果）。"""
+    if not rows:
+        return
+    try:
+        import db
+        db.matrix_put_many(PROVIDER_NAME, rows)
+        print(f"  高德距离矩阵：{len(rows)} 对已写入本地缓存（下次同点位零请求）")
+    except Exception as e:  # noqa: BLE001
+        print(f"  [矩阵缓存] 写入失败，忽略：{e}")
+
 
 # ============================================================
 # 坐标系转换
@@ -355,13 +399,21 @@ class AmapClient:
         # 预先把全部点转成 GCJ-02，避免在循环里重复计算
         pts_gcj = [bd09_to_gcj02(lng, lat) for lat, lng in points_bd09]
 
-        print(f"  高德距离矩阵：{n} 个点，需 {n} 次请求（按请求计费）")
+        # ---- A7：先吃 SQLite 里的点对缓存（跨任务复用、进程重启后仍有效）----
+        cached = _cache_load(points_bd09, matrix)
+        pending = []          # 本次新取到的点对，稍后统一落库
+        if cached:
+            print(f"  高德距离矩阵：{n} 个点，其中 {cached} 对命中本地缓存（不消耗配额）")
 
         def _fetch_column(j: int) -> int:
             """以 j 为终点，一次请求取回其余全部起点，返回成功填充的对数。"""
             d_lng, d_lat = pts_gcj[j]
             filled = 0
-            origins_all = [(i, pts_gcj[i]) for i in range(n) if i != j]
+            # 已经缓存到的点对不再请求——这是缓存节省配额的关键
+            origins_all = [(i, pts_gcj[i]) for i in range(n)
+                           if i != j and matrix[i][j] is None]
+            if not origins_all:
+                return 0
             for start in range(0, len(origins_all), MAX_ORIGINS):
                 batch = origins_all[start:start + MAX_ORIGINS]
                 origins_str = "|".join(f"{lng},{lat}" for _, (lng, lat) in batch)
@@ -393,6 +445,9 @@ class AmapClient:
                         # 缺耗时：按 30km/h 兜底估算，保证时长约束可用
                         dur_f = dist_f / 1000.0 / 30.0 * 3600
                     matrix[i][j] = (dist_f, dur_f)
+                    pending.append((points_bd09[i][0], points_bd09[i][1],
+                                    points_bd09[j][0], points_bd09[j][1],
+                                    dist_f, dur_f))
                     filled += 1
             return filled
 
@@ -433,8 +488,11 @@ class AmapClient:
                     if dist_f < 0:
                         still_missing += 1
                         continue
-                    matrix[i][j] = (dist_f, dur_f if dur_f > 0
-                                    else dist_f / 1000.0 / 30.0 * 3600)
+                    final_dur = dur_f if dur_f > 0 else dist_f / 1000.0 / 30.0 * 3600
+                    matrix[i][j] = (dist_f, final_dur)
+                    pending.append((points_bd09[i][0], points_bd09[i][1],
+                                    points_bd09[j][0], points_bd09[j][1],
+                                    dist_f, final_dur))
             recovered = len(missing) - still_missing
             print(f"  补齐完成：恢复 {recovered}/{len(missing)} 对"
                   + (f"，仍缺失 {still_missing} 对" if still_missing else "，矩阵完整"))
@@ -442,6 +500,7 @@ class AmapClient:
                 print("  提示：持续缺失通常意味着 QPS 超限，可在 .env 中调大 "
                       "AMAP_QPS_DELAY（默认 0.35 秒）")
 
+        _cache_save(pending)
         return matrix
 
 

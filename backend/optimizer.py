@@ -283,17 +283,90 @@ def build_initial_solution(passengers: List[Passenger], dest: Passenger, dm: Dis
 INFEASIBLE_PENALTY = 1e6
 
 
+def vehicle_feasible(v: Vehicle) -> bool:
+    """单车硬约束：座位数 ≤ 6，单车行程 ≤ 5400 秒。"""
+    return v.duration_s <= MAX_ROUTE_SECONDS and len(v.passengers) <= CAR_CAPACITY
+
+
+def solution_feasible(vehicles: List[Vehicle]) -> bool:
+    """整解可行性：每辆车都满足硬约束，且没有空车。"""
+    return bool(vehicles) and all(vehicle_feasible(v) for v in vehicles)
+
+
+def lower_bound_cost(direct_m: List[float], capacity: int = CAR_CAPACITY) -> float:
+    """
+    总费用的**严格下界**（A8：gap 的分母；宁可松，不可错）。
+
+    由两个各自可证明成立的下界取大者：
+
+    (1) 人均直达摊派界
+        任取一车 v，其路线为 h1→h2→…→hk→活动点，里程 D_v。
+        对车内任一乘客 j，子路径 h_j→…→活动点 的长度 ≤ D_v（各段非负），
+        由三角不等式又有 d(h_j, 活动点) ≤ 该子路径长度，故 d_j ≤ D_v。
+        车内最多 capacity 人 ⇒ Σ_{j∈G_v} d_j ≤ capacity·D_v。
+        对所有车求和：Σ_j d_j ≤ capacity·Σ_v D_v
+        ⇒ Σ_v D_v ≥ (Σ_j d_j) / capacity。
+
+    (2) 按容量分组的 max 界
+        任意一车的里程 ≥ 车内最远那位乘客的直达距离，
+        即 D_v ≥ max_{j∈G_v} d_j。把乘客按直达距离降序排为 d_(1)≥d_(2)≥…，
+        对第 i 组：前 capacity·(i−1)+1 个乘客（值均 ≥ d_(capacity·(i−1)+1)）
+        最多只能塞满 i−1 辆车，故至少 i 辆车里各有一位乘客的直达距离
+        ≥ d_(capacity·(i−1)+1)，即第 i 大的「车里程」≥ 该值。
+        于是 Σ_v D_v ≥ Σ_{i=1..ceil(n/capacity)} d_(capacity·(i−1)+1)。
+
+    再把「车数 ≥ ceil(n/capacity)」与「费用对里程、车数均单调不减」代入
+    费用函数 C = BASE_FEE·k + PER_KM_FEE·Σ_v max(D_v,km − FREE_KM, 0)：
+
+        C ≥ BASE_FEE·k_min + PER_KM_FEE·max(S_lb/1000 − FREE_KM·k_min, 0)
+
+    有效性依赖两个单调性：把 ΣD 与 k 各自放大，C 不会变小
+    （Σ_v max(D_v−3, 0) ≥ max(Σ_v D_v − 3k, 0) ≥ max(S_lb − 3·k_min, 0)）。
+
+    说明：该下界不含单车 5400 秒时长约束，也不含 max_vehicles 约束——
+    这两个约束只会让真实最优更贵，故对下界无影响（下界仍有效）。
+    代价是**偏松**：实测本项目 15 人实例 gap ≈ 55%~65%，因此 STOP_GAP
+    在正常规模下不会触发（详见 v1.1/A7-A8 实现说明.md §4）。
+    """
+    n = len(direct_m)
+    if n <= 0:
+        return 0.0
+    k_min = -(-n // capacity)                      # ceil(n / capacity)
+    total = sum(direct_m)
+
+    lb1 = total / capacity
+    desc = sorted(direct_m, reverse=True)
+    lb2 = sum(desc[capacity * i] for i in range(k_min) if capacity * i < n)
+
+    s_lb = max(lb1, lb2)
+    km = s_lb / 1000.0
+    return BASE_FEE * k_min + PER_KM_FEE * max(km - FREE_KM * k_min, 0.0)
+
+
+def gap_ratio(best_cost: float, lb: Optional[float]) -> Optional[float]:
+    """相对下界的差距（0.03 = 3%）。下界缺失或非正时返回 None。"""
+    if lb is None or lb <= 0:
+        return None
+    return max(0.0, (best_cost - lb) / lb)
+
+
 def evaluate(vehicles: List[Vehicle], baseline_cost: float, n_passengers: int,
              mode="cost", max_vehicles=None):
     """
     cost            : (总费用, 总时长, 车数)
     fewest_vehicles : (车数, 总费用, 总时长)
     max_vehicles    : 车数上限硬约束；超出一辆就在首元素上加一个罚分。
+    单车时长        : 超过 MAX_ROUTE_SECONDS 的车按辆数计罚分（与上限同理）。
 
     关于 V1.1 的 balanced（加权和）模式已被删除：P1 实测其权重 0.5/0.3/0.2 因
     time_norm / vehicle_norm 分母极大，使 cost 项占最终 score 约 76%，产出与 cost
     无系统差异（15 实例平均 +1.00% 费用），属冗余模式。
     真正的「少用车」需求请用 fewest_vehicles 或 max_vehicles 约束表达。
+
+    关于时长罚分（A8 修复）：原先只有 `_best_insertion` 检查单车时长，
+    初始解（DBSCAN + 2-opt，不过时长）与最终结果都不检查，导致**超时路线被当作
+    成功方案返回**（实测散场模式出现 5984 秒 > 5400 秒上限仍报成功）。
+    现在把违例计入排序分，搜索才有动力把超时路线拆掉。
     """
     total_cost = sum(v.cost for v in vehicles)
     total_duration = sum(v.duration_s for v in vehicles)
@@ -301,11 +374,13 @@ def evaluate(vehicles: List[Vehicle], baseline_cost: float, n_passengers: int,
     over = 0
     if max_vehicles is not None and vehicle_count > max_vehicles:
         over = vehicle_count - max_vehicles
+    over_dur = sum(1 for v in vehicles if v.duration_s > MAX_ROUTE_SECONDS)
+    pen = (over + over_dur) * INFEASIBLE_PENALTY
 
     if mode == "fewest_vehicles":
-        return (vehicle_count + over * INFEASIBLE_PENALTY, total_cost, total_duration)
+        return (vehicle_count + pen, total_cost, total_duration)
     # 默认 cost
-    return (total_cost + over * INFEASIBLE_PENALTY, total_duration, vehicle_count)
+    return (total_cost + pen, total_duration, vehicle_count)
 
 
 # ============ ALNS ============
@@ -315,7 +390,8 @@ class ALNS:
                  baseline_cost: float, n_passengers: int,
                  mode="cost", time_budget_s=300, trace=False,
                  T0=None, T_end_ratio=0.35, max_vehicles=None, cooling="time",
-                 alpha=None, two_phase=None, phase1_ratio=0.4):
+                 alpha=None, two_phase=None, phase1_ratio=0.4,
+                 cost_lb=None, gap_stop_pct=None, stable_s=None):
         """
         T0           : 退火初温；None 时按模式显式推定（见 _default_T0）
         T_end_ratio  : 按时间降温时，预算末的 T / T0。0.35 取自 P1 实测——当前调度在
@@ -324,6 +400,11 @@ class ALNS:
         max_vehicles : 车数上限硬约束
         two_phase    : fewest_vehicles 默认启用两阶段（先定车数，再在同车数下压费用）；
                        显式传 False 可关闭
+        cost_lb      : 费用下界（见 lower_bound_cost）。仅当给出且 gap_stop_pct 不为 None
+                       时才启用 gap 提前终止
+        gap_stop_pct : gap 提前终止阈值，小数（0.05 = 5%）。None 表示不启用
+        stable_s     : 「连续无改善」提前终止的窗口（秒）。None 表示不启用。
+                       只作用于**最后一个阶段**，避免两阶段搜索的第 1 阶段被提前打断
         """
         self.trace = [] if trace else None  # 诊断用：记录收敛轨迹，默认关闭不影响行为
         self.vehicles = vehicles
@@ -344,12 +425,39 @@ class ALNS:
         self.two_phase = (mode == "fewest_vehicles" and max_vehicles is None
                           and two_phase is not False)
 
+        # ---- A8：终止判定所需的输入 ----
+        self.cost_lb = cost_lb
+        self.gap_stop_pct = gap_stop_pct
+        self.stable_s = stable_s
+        self.stop = None      # {'reason','detail','elapsed','gap'}，由 _run_phase 填
+
         # 初始解
         self.best = [self._copy_vehicle(v) for v in vehicles]
         self.best_score = evaluate(self.best, baseline_cost, n_passengers, mode, max_vehicles)
         self.current = [self._copy_vehicle(v) for v in vehicles]
         self.current_score = self.best_score
         self.stats = {}
+
+    def _maybe_stop(self, mode, allow_early_stop, iters, last_improve_t):
+        """
+        判断是否提前终止（A8）。返回终止原因字符串或 None。
+
+        - gap ≤ 阈值：仅在**费用为主要目标**的阶段判定。fewest_vehicles 的目标是车数，
+          费用下界对该目标没有意义（且 k_min 并非受 5400 秒约束下的有效下界），
+          因此不做任何最优性声明，宁可让它跑到预算用尽。
+          gap 需遍历 best 求和，故每 50 次迭代才算一次（停止判定不需要毫秒级精度）。
+        - 连续无改善：只在最后一个阶段判定（allow_early_stop），
+          否则两阶段搜索的第 1 阶段可能刚定完车数就退出、phase 2 根本没机会跑。
+        """
+        if allow_early_stop and self.stable_s is not None:
+            if time.time() - last_improve_t >= self.stable_s:
+                return "STOP_STABLE"
+        if (self.gap_stop_pct is not None and self.cost_lb
+                and mode == "cost" and iters % 50 == 0):
+            g = gap_ratio(sum(v.cost for v in self.best), self.cost_lb)
+            if g is not None and g <= self.gap_stop_pct:
+                return "STOP_GAP"
+        return None
 
     def _default_T0(self, score, mode, max_vehicles=None):
         """
@@ -386,7 +494,7 @@ class ALNS:
         return -1
 
     def _is_feasible(self, v: Vehicle):
-        return v.duration_s <= MAX_ROUTE_SECONDS and len(v.passengers) <= CAR_CAPACITY
+        return vehicle_feasible(v)
 
     def _rebuild_vehicle(self, passenger_list: List[Passenger]):
         """给定乘客列表，2-opt 优化顺序并算费用"""
@@ -503,10 +611,13 @@ class ALNS:
 
     # ---- 单阶段搜索 ----
     def _run_phase(self, phase_budget, mode, max_vehicles, time_offset,
-                   progress_callback=None, phase_name="main"):
+                   progress_callback=None, phase_name="main",
+                   allow_early_stop=False):
         start = time.time()
         iters = 0
         accept_worse = 0
+        last_improve_t = start          # A8：连续无改善窗口的计时起点
+        stop_reason = None
         # T0 用「去掉罚分」的能量来定标：初始解若违反 max_vehicles，self.best_score 里
         # 含着 1e6 罚分，直接拿它算温度会把 T0 放大到 1e5 量级（退火失效）
         best_energy = self._energy(self.best, mode)
@@ -563,6 +674,7 @@ class ALNS:
                     self.best_score = score
                     best_energy = energy_now
                     self.best = [self._copy_vehicle(v) for v in self.current]
+                    last_improve_t = time.time()
                     if self.trace is not None:
                         self.trace.append({
                             "t": round(time_offset + time.time() - start, 3), "iter": iters,
@@ -574,21 +686,33 @@ class ALNS:
                 self.current = [self._copy_vehicle(v) for v in self.best]
 
             if progress_callback and iters % 50 == 0:
-                progress_callback(time_offset + time.time() - start, iters, self.best_score)
+                # 第 4 个参数是「不含罚分的真实费用」：best_score[0] 可能含 1e6 罚分
+                # （车数超限 / 单车超时），直接当费用上报会让进度条显示天文数字
+                progress_callback(time_offset + time.time() - start, iters,
+                                  self.best_score, sum(v.cost for v in self.best))
+
+            # A8 终止判定：gap 达标 / 长时间无改善（仅最后一个阶段）
+            stop_reason = self._maybe_stop(mode, allow_early_stop, iters, last_improve_t)
+            if stop_reason:
+                break
 
         return {"name": phase_name, "mode": mode, "max_vehicles": max_vehicles,
                 "iters": iters, "elapsed": round(time.time() - start, 3),
-                "accept_worse": accept_worse, "T0": T0, "T_end": T}
+                "accept_worse": accept_worse, "T0": T0, "T_end": T,
+                "stop": stop_reason}
 
     # ---- 主循环 ----
     def run(self, progress_callback=None):
         total_start = time.time()
 
         if self.two_phase:
-            # 阶段 1：车数优先，先把「最少几辆车」定下来
+            # 阶段 1：车数优先，先把「最少几辆车」定下来。
+            # allow_early_stop=False：这一阶段的目标是车数，费用 gap 无意义；
+            # 若按「无改善」提前退出，phase 2 就完全没机会跑，故必须跑满预算。
             p1_budget = self.time_budget * self.phase1_ratio
             ph1 = self._run_phase(p1_budget, "fewest_vehicles", None, 0.0,
-                                  progress_callback, "fewest_vehicles")
+                                  progress_callback, "fewest_vehicles",
+                                  allow_early_stop=False)
             n_veh = len(self.best)
 
             # 阶段 2：以阶段 1 的最优解为起点，在「车数 ≤ n_veh」硬约束下最小化费用。
@@ -599,13 +723,22 @@ class ALNS:
                                        "cost", n_veh)
             self.current_score = self.best_score
             ph2 = self._run_phase(self.time_budget - p1_budget, "cost", n_veh,
-                                  p1_budget, progress_callback, "cost_under_cap")
+                                  p1_budget, progress_callback, "cost_under_cap",
+                                  allow_early_stop=True)
             phases = [ph1, ph2]
         else:
             phases = [self._run_phase(self.time_budget, self.mode, self.max_vehicles,
-                                      0.0, progress_callback, self.mode)]
+                                      0.0, progress_callback, self.mode,
+                                      allow_early_stop=True)]
 
         last = phases[-1]
+        # 终止原因：取第一个提前终止的阶段；都没提前终止即为预算用尽
+        reason = next((p["stop"] for p in phases if p.get("stop")), None)
+        self.stop = {
+            "reason": reason or "STOP_TIMEOUT",
+            "early": bool(reason),
+            "elapsed": round(time.time() - total_start, 3),
+        }
         self.stats = {
             "iters": sum(p["iters"] for p in phases),
             "elapsed": round(time.time() - total_start, 3),
@@ -613,21 +746,87 @@ class ALNS:
             "T0": last["T0"], "T_end": last["T_end"],
             "cooling": self.cooling, "alpha": self.alpha,
             "two_phase": self.two_phase, "phases": phases,
+            "stop": dict(self.stop),
         }
         return self.best
 
 
 # ============ 入口函数 ============
+# gap 提前终止阈值：取自《算法详细设计 V1.1》§十四「gap <= 5%」
+GAP_STOP_PCT = 0.05
+# 「连续无改善」默认窗口：设计文档给的是 300 秒预算下 60 秒（= 20% 预算），
+# 按比例缩放到实际预算；下限 3 秒（预算 10 秒的默认档），上限 60 秒。
+STABLE_S_RATIO = 0.2
+STABLE_S_MIN = 3.0
+STABLE_S_MAX = 60.0
+
+
+def stable_window(time_budget_s: float) -> float:
+    """按预算缩放「连续无改善」窗口（见 STABLE_S_* 常量说明）。"""
+    return min(STABLE_S_MAX, max(STABLE_S_MIN, STABLE_S_RATIO * float(time_budget_s)))
+
+
+def stop_reason_text(reason: str, stop: Optional[dict] = None,
+                     gap: Optional[float] = None) -> str:
+    """终止原因的中文说明（写入 optimization_job.stop_reason，供前端/审计阅读）。
+
+    阈值从 stop 字典里取实际生效值（可能被参数覆盖），避免文案与真实判据不一致。
+    """
+    stop = stop or {}
+    g = f"，与下界差 {gap * 100:.1f}%" if gap is not None else ""
+    if reason == "STOP_GAP":
+        pct = stop.get("gap_stop_pct")
+        pct = GAP_STOP_PCT if pct is None else pct
+        return f"候选解与理论下界差距已 ≤ {pct * 100:.0f}%{g}，提前收敛"
+    if reason == "OPTIMAL":
+        return "已证明达到全局最优（费用等于理论下界）"
+    if reason == "STOP_STABLE":
+        win = stop.get("stable_s")
+        return (f"连续 {win:g} 秒无改善，判定收敛并提前结束"
+                if win else "连续无改善，判定收敛并提前结束")
+    if reason == "STOP_TIMEOUT":
+        return f"求解预算用尽，返回当前最优{g}"
+    if reason == "FAILED":
+        return "未找到满足硬约束（单车 ≤ 90 分钟）的可行方案"
+    return reason or ""
+
+
 def optimize(passengers: List[Passenger], dest: Passenger,
              dm: DistanceMatrix, mode="cost", time_budget_s=300, stage_cb=None,
-             diag: Optional[dict] = None, max_vehicles: Optional[int] = None):
+             diag: Optional[dict] = None, max_vehicles: Optional[int] = None,
+             job_cb=None, progress_cb=None, direct_pairs=None,
+             gap_stop_pct=None, stable_s=None):
     """
-    主入口：给定乘客列表 + 终点 + 距离矩阵，返回优化后的车辆列表
-    stage_cb: 可选回调，阶段变化时通知（"initial" / "alns"）
-    diag: 可选诊断字典，传入后会填入 initial_score/stats/trace（用于收益验证，默认 None 无副作用）
-    max_vehicles: 车数上限硬约束（None 表示不限）
+    主入口：给定乘客列表 + 终点 + 距离矩阵，返回 (最优车辆列表, 基线费用)
+
+    stage_cb     : 可选回调，阶段变化时通知（"initial" / "alns"）——旧前端进度条用
+    diag         : 可选诊断字典，传入后填入 initial_score/stats/trace/job
+    max_vehicles : 车数上限硬约束（None 表示不限）
+    job_cb       : A8 作业状态回调，收到 {'kind': ...} 形式的事件字典：
+                     {'kind':'init'}                                    → INIT
+                     {'kind':'feasible', 'vehicles':n, 'cost':x}        → FEASIBLE
+                     {'kind':'optimizing'}                              → OPTIMIZING
+                     {'kind':'progress','iteration','best_cost','elapsed'} → 周期进度
+                     {'kind':'finished','status','sub_status','gap',
+                      'lower_bound','best_cost','iteration','elapsed',
+                      'stop_reason'}                                    → 终态
+    progress_cb  : 可选，(elapsed_total, iters, best_cost) 周期回调（比 job_cb 更密）
+    direct_pairs : 可选，[(直达距离_m, 直达耗时_s), ...]，与 passengers 同序、
+                   **物理行驶方向**（集合=家→活动点，散场=活动点→家）。
+                   None 时退化为 dm.get(i, dest)。散场模式下 dm 是转置矩阵，
+                   必须由调用方传入正向值，否则 gap 下界用错方向。
+    gap_stop_pct : gap 提前终止阈值；None = 用默认 GAP_STOP_PCT（仅 cost 模式生效）；
+                   传负数可关闭（对照实验用）
+    stable_s     : 「连续无改善」窗口（秒）；None = 按预算自动缩放（stable_window）；
+                   传正无穷可关闭（对照实验用）
+
+    返回：(best, baseline_cost)。可行性判定与终止原因写入 diag["job"]。
     """
     n_p = len(passengers)
+    _gap_pct = GAP_STOP_PCT if gap_stop_pct is None else gap_stop_pct
+    if _gap_pct is not None and _gap_pct < 0:
+        _gap_pct = None
+    _stable = stable_window(time_budget_s) if stable_s is None else stable_s
     # 容量下限：每车最多 CAR_CAPACITY 人，低于此值的上限不可能满足，直接上调并提示
     if max_vehicles is not None:
         capacity_min = -(-n_p // CAR_CAPACITY) if n_p else 0
@@ -639,31 +838,103 @@ def optimize(passengers: List[Passenger], dest: Passenger,
 
     baseline_cost = sum(calc_cost(dm.get(i, n_p)[0]) for i in range(n_p))
 
+    # 直达口径（物理方向）：用于费用下界与「数学上是否可解」的判定
+    if direct_pairs is None:
+        direct_pairs = [dm.get(i, n_p) for i in range(n_p)]
+    direct_m = [float(d or 0.0) for d, _ in direct_pairs]
+    direct_s = [float(s or 0.0) for _, s in direct_pairs]
+
+    # 费用下界（A8：gap 的分母）。仅 cost 目标有意义，fewest_vehicles 只做记录
+    lb = lower_bound_cost(direct_m)
+    if job_cb:
+        job_cb({"kind": "init"})
+
     # 初始解
     print("  构建初始解...")
     if stage_cb:
         stage_cb("initial")
     vehicles = build_initial_solution(passengers, dest, dm)
     print(f"  初始解: {len(vehicles)} 辆车")
+    initial_feasible = solution_feasible(vehicles)
+    if job_cb:
+        job_cb({"kind": "feasible", "vehicles": len(vehicles),
+                "cost": round(sum(v.cost for v in vehicles), 2),
+                "initial_feasible": initial_feasible})
 
     if diag is not None:
         diag["initial_score"] = evaluate(vehicles, baseline_cost, len(passengers), mode,
                                          max_vehicles)
         diag["initial_vehicles"] = len(vehicles)
         diag["baseline_cost"] = baseline_cost
+        diag["lower_bound"] = lb
 
     # ALNS 优化
     print(f"  启动 ALNS，预算 {time_budget_s} 秒...")
     if stage_cb:
         stage_cb("alns")
+    if job_cb:
+        job_cb({"kind": "optimizing"})
+
+    def _on_progress(elapsed, iters, best_score, best_cost=None):
+        # best_cost 由 ALNS 直接给出真实费用（best_score[0] 可能含 1e6 硬约束罚分，
+        # 直接当费用上报会让进度条显示天文数字）
+        if best_cost is None:
+            best_cost = float(best_score[0]) if mode == "cost" else None
+        else:
+            best_cost = round(float(best_cost), 2)
+        if job_cb:
+            job_cb({"kind": "progress", "iteration": iters, "best_cost": best_cost,
+                    "elapsed": round(elapsed, 2)})
+        if progress_cb:
+            progress_cb(elapsed, iters, best_cost)
+
     alns = ALNS(vehicles, passengers, dest, dm, baseline_cost, len(passengers), mode,
-                time_budget_s, trace=(diag is not None), max_vehicles=max_vehicles)
-    best = alns.run()
+                time_budget_s, trace=(diag is not None), max_vehicles=max_vehicles,
+                cost_lb=lb, gap_stop_pct=(_gap_pct if mode == "cost" else None),
+                stable_s=_stable)
+    best = alns.run(progress_callback=_on_progress)
+
+    stop = dict(alns.stop or {})
+    stop["stable_s"] = _stable
+    stop["gap_stop_pct"] = _gap_pct
+    best_cost = sum(v.cost for v in best)
+    gap = gap_ratio(best_cost, lb)
+    # gap 恰好为 0（费用等于下界）→ 已证明全局最优；只有 cost 目标才敢这么断言
+    reason = stop.get("reason") or "STOP_TIMEOUT"
+    if mode == "cost" and gap is not None and gap <= 1e-9:
+        reason = "OPTIMAL"
+    stop["reason"] = reason
+
+    final_ok = solution_feasible(best)
+    job = {
+        "status": reason if final_ok else "FAILED",
+        "sub_status": None if final_ok else (
+            "PROVEN_INFEASIBLE"
+            if any(s > MAX_ROUTE_SECONDS for s in direct_s) else "SEARCH_FAILED"),
+        "best_cost": round(best_cost, 2),
+        "lower_bound": round(lb, 2),
+        "gap": None if gap is None else round(gap, 4),
+        "iteration": int(alns.stats.get("iters", 0)),
+        "elapsed": float(alns.stats.get("elapsed", 0.0)),
+        "feasible": final_ok,
+        "initial_feasible": initial_feasible,
+    }
+    job["stop_reason"] = stop_reason_text(job["status"], stop, job["gap"])
 
     if diag is not None:
         diag["stats"] = getattr(alns, "stats", {})
         diag["trace"] = alns.trace or []
         diag["final_score"] = evaluate(best, baseline_cost, len(passengers), mode, max_vehicles)
+        diag["job"] = job
+        if not final_ok:
+            worst = max((v.duration_s for v in best), default=0)
+            diag["infeasible"] = {"sub_status": job["sub_status"], "worst_route_s": worst,
+                                  "limit_s": MAX_ROUTE_SECONDS}
+    if not final_ok:
+        print(f"  [不可行] 搜索结束时仍有路线超过 {MAX_ROUTE_SECONDS}s 上限"
+              f"（sub_status={job['sub_status']}）")
+    if job_cb:
+        job_cb({"kind": "finished", **job, "stop_reason": job["stop_reason"]})
 
     # 上限没满足（常见于 5400 秒单车时长约束与地理分散共同作用），如实提示
     if max_vehicles is not None and len(best) > max_vehicles:

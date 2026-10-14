@@ -186,6 +186,15 @@
       <span class="step-dot" id="sd3"></span>ALNS 优化中
       <span style="margin-left:auto;" id="elapsed_wrap">已运行 <b id="elapsed">0</b> 秒</span>
     </div>
+    <!-- A8：求解作业状态（8 态枚举）。terminals 之前逐态变化，终止时给出原因 -->
+    <div style="margin-top:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <span class="status-tag st-idle" id="job_status_tag" title="求解作业状态">准备中</span>
+      <span style="font-size:12px; color:#606266;" id="job_status_text"></span>
+      <span style="font-size:12px; color:#909399; margin-left:auto;" id="job_meta"></span>
+    </div>
+    <div style="margin-top:8px; height:6px; background:#f0f2f5; border-radius:3px; overflow:hidden;">
+      <div id="job_bar" style="height:100%; width:0; background:#409eff; transition:width .4s;"></div>
+    </div>
   </div>
 
   <!-- 地图 -->
@@ -640,15 +649,16 @@ async function submitTask() {
         const r = await fetch('/api/tasks/' + taskId);
         const d = await r.json();
         setStep(d.stage);
-        if (d.status === 'DONE') {
+        renderJobStatus(d);
+        if (d.terminal) {
           clearInterval(poll); clearInterval(elapsedTimer);
-          showResult(d.result);
-          btn.disabled = false;
-          btn.textContent = '提交优化任务';
-        } else if (d.status === 'FAILED') {
-          clearInterval(poll); clearInterval(elapsedTimer);
-          document.getElementById('progress').style.display = 'none';
-          showErr('优化失败: ' + (d.error || '未知错误'));
+          if (d.job_status === 'FAILED') {
+            document.getElementById('progress').style.display = 'none';
+            showErr('优化失败: ' + [d.sub_status_text, d.error]
+                .filter(Boolean).join('；') || '未知错误');
+          } else {
+            showResult(d.result);
+          }
           btn.disabled = false;
           btn.textContent = '提交优化任务';
         }
@@ -661,6 +671,58 @@ async function submitTask() {
     btn.disabled = false;
     btn.textContent = '提交优化任务';
   }
+}
+
+// ---------------- A8：求解作业状态（八态） ----------------
+// 与后端 main.py 的 JOB_STATUS_TEXT / optimization_job.status 一一对应。
+// 设计原则：文案只描述「求解器实际做了什么」，不额外承诺——
+// 预算用尽（STOP_TIMEOUT）就写「预算用尽」，不美化成功率。
+const JOB_STATE_STYLE = {
+  INIT:        ['st-idle', '准备中'],
+  FEASIBLE:    ['st-wait', '已找到可行解'],
+  OPTIMIZING:  ['st-wait', '优化中'],
+  STOP_GAP:    ['st-ok',   '提前收敛'],
+  STOP_TIMEOUT:['st-ok',   '预算用尽'],
+  STOP_STABLE: ['st-ok',   '已收敛'],
+  OPTIMAL:     ['st-ok',   '全局最优'],
+  FAILED:      ['st-fail', '未找到可行方案'],
+};
+
+function jobStateLabel(s) {
+  const st = JOB_STATE_STYLE[s];
+  return st ? st[1] : (s || '');
+}
+
+// 结果卡片里的求解状态脚注：让用户知道这个方案是「跑满预算」还是「提前收敛」，
+// 以及离理论下界还有多远（gap 偏大是常态，见 v1.1/A7-A8 实现说明.md §4）
+function solverNoteHTML(r) {
+  if (!r || !r.job_status) return '';
+  const bits = ['求解状态 <b>' + jobStateLabel(r.job_status) + '</b>'];
+  if (r.gap != null) bits.push('距理论下界 ' + (r.gap * 100).toFixed(0) + '%');
+  return ' · ' + bits.join(' · ');
+}
+
+function renderJobStatus(d) {
+  if (!d || !d.job_status) return;
+  const [cls, label] = JOB_STATE_STYLE[d.job_status] || ['st-idle', d.job_status];
+  const tag = document.getElementById('job_status_tag');
+  tag.className = 'status-tag ' + cls;
+  tag.textContent = label;
+  tag.title = d.job_status + (d.sub_status ? ' / ' + d.sub_status : '');
+  // 终止时优先展示终止原因（含 gap 说明），进行中展示状态描述
+  document.getElementById('job_status_text').textContent =
+      d.stop_reason || d.job_status_text || '';
+
+  const meta = [];
+  if (d.best_cost != null) meta.push('当前最优 ¥' + Number(d.best_cost).toFixed(2));
+  if (d.iteration) meta.push('迭代 ' + d.iteration);
+  if (d.gap != null) meta.push('距下界 ' + (d.gap * 100).toFixed(0) + '%');
+  if (!d.terminal && d.eta_seconds != null) meta.push('预计剩余 ' + d.eta_seconds + ' 秒');
+  document.getElementById('job_meta').textContent = meta.join(' · ');
+
+  const bar = document.getElementById('job_bar');
+  bar.style.width = Math.max(0, Math.min(100, d.progress || 0)) + '%';
+  bar.style.background = d.job_status === 'FAILED' ? '#f56c6c' : '#409eff';
 }
 
 // stage: matrix / initial / alns / done / failed / pending
@@ -755,7 +817,8 @@ function showResult(result) {
   const isDrop = result.direction === 'dropoff';
   const list = document.getElementById('vehicles_list');
   list.innerHTML = '<p>共 <b>' + result.vehicle_count + '</b> 辆车 · 出发时间 <b>' +
-      (document.getElementById('depart_time').value || '未设置') + '</b></p>';
+      (document.getElementById('depart_time').value || '未设置') + '</b>' +
+      solverNoteHTML(result) + '</p>';
   result.vehicles.forEach((v, idx) => {
     const color = VEHICLE_COLORS[idx % VEHICLE_COLORS.length];
     const orderLine = isDrop
