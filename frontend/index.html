@@ -42,6 +42,7 @@
   .st-ok { background: #f0f9eb; color: #67c23a; }
   .st-fail { background: #fef0f0; color: #f56c6c; }
   .st-wait { background: #fdf6ec; color: #e6a23c; }
+  .st-idle { background: #f4f4f5; color: #909399; }
   .row-line { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
   .row-line .in-name { width: 90px; flex: none; }
   .row-line .in-addr { flex: 1; }
@@ -58,6 +59,16 @@
   .tl-chip { font-size: 12px; background: #f4f6f9; border-radius: 12px; padding: 3px 10px; color: #606266; }
   .tl-chip.first { background: #ecf5ff; color: #409eff; }
   .tl-chip.last { background: #fef0f0; color: #f56c6c; }
+  .pax-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
+  .pax-table th { text-align: left; color: #909399; font-weight: 400; padding: 4px 6px; border-bottom: 1px solid #ebeef5; white-space: nowrap; }
+  .pax-table td { padding: 5px 6px; color: #606266; border-bottom: 1px solid #f5f7fa; }
+  .pax-table tr:last-child td { border-bottom: none; }
+  .pax-table .pax-seq { color: #909399; width: 30px; }
+  .pax-table .pax-cost { color: #f56c6c; font-weight: 500; }
+  .pax-table .pax-inc { color: #e6a23c; }
+  .pax-table .pax-inc.zero { color: #c0c4cc; }
+  .pax-warn { display: inline-block; font-size: 11px; background: #fdf6ec; color: #e6a23c; border-radius: 10px; padding: 1px 7px; white-space: nowrap; }
+  .pax-foot { font-size: 12px; color: #909399; margin-top: 6px; }
   #map { width: 100%; height: 500px; border-radius: 8px; margin: 16px 0; }
   #map_card:fullscreen #map { height: 90vh; }
   #map_card:-webkit-full-screen #map { height: 90vh; }
@@ -113,8 +124,11 @@
           <button class="mini-btn" id="dest_search_btn" style="flex:none;">检索</button>
         </div>
         <div style="display:flex; gap:8px; margin-top:8px; align-items:center;">
-          <span class="status-tag st-ok" id="dest_status">已定位</span>
-          <span style="font-size:12px; color:#909399;" id="dest_coord">34.7421, 113.7536</span>
+          <!-- 初始状态必须是「未设置」：页面加载时并未做过任何检索，
+               旧版这里硬编码「已定位」+ 固定坐标，会谎报一个不存在的检索结果 -->
+          <span class="status-tag st-idle" id="dest_status"
+                title="尚未设置活动点：可在地图上点击选点，或输入地址后点「检索」">待设置</span>
+          <span style="font-size:12px; color:#909399;" id="dest_coord">—</span>
         </div>
         <div id="pick_map"></div>
       </div>
@@ -248,6 +262,7 @@ let map = null;
 let pickMap = null;
 let destPoint = null;
 let destMarker = null;
+let destState = 'pending';   // 活动点来源状态，见 DEST_STATUS
 let elapsedTimer = null;
 let currentDirection = 'pickup';
 let currentResult = null;
@@ -321,28 +336,63 @@ function initPickMap() {
   });
   pickMap.on('click', function (e) {
     const bd = gcjToBd(e.lnglat);
-    setDestPoint(bd[0], bd[1]);
+    setDestPoint(bd[0], bd[1], false, 'manual');
   });
-  setDestPoint(113.7536, 34.7421, true);
+  setDestPoint(113.7536, 34.7421, true, 'default');
 }
 
-// lng / lat 均为 BD09
-function setDestPoint(lng, lat, silent) {
+/**
+ * 活动点状态机的唯一出口。
+ * 页面初始为「待设置」；此后每一次落点都必须经由 setDestPoint 带上来源，
+ * 状态与真实来源一一对应，避免出现「UI 说已定位、实际没检索过」的假状态。
+ */
+const DEST_STATUS = {
+  pending:   { cls: 'st-idle', text: '待设置',     tip: '尚未设置活动点：可在地图上点击选点，或输入地址后点「检索」' },
+  default:   { cls: 'st-idle', text: '默认点',     tip: '页面预置的示例坐标（郑州东站），未经过地址检索' },
+  manual:    { cls: 'st-ok',   text: '手动选点',   tip: '由地图点击或拖拽标记选取' },
+  searching: { cls: 'st-wait', text: '检索中...', tip: '正在向后端查询该地址的坐标' },
+  dirty:     { cls: 'st-wait', text: '地址已改', tip: '地址框已修改但未重新检索，当前落点仍是上一次的结果' },
+  geocode:   { cls: 'st-ok',   text: '已定位',     tip: '由地址检索得到' },
+  failed:    { cls: 'st-fail', text: '未找到该地址', tip: '地址检索失败，请检查地址写法或稍后重试' },
+  noMap:     { cls: 'st-fail', text: '地图未加载', tip: '高德地图 JS API 未就绪，无法选点；可改用地址检索' },
+};
+
+// 坐标为「未经地址检索确认」的状态：提交前需要提醒用户
+const UNVERIFIED_DEST = { pending: 1, default: 1, dirty: 1, noMap: 1, failed: 1 };
+
+function setDestStatus(state) {
+  const key = Object.prototype.hasOwnProperty.call(DEST_STATUS, state) ? state : 'pending';
+  destState = key;
+  const s = DEST_STATUS[key];
+  const tag = document.getElementById('dest_status');
+  tag.className = 'status-tag ' + s.cls;
+  tag.textContent = s.text;
+  tag.title = s.tip;
+}
+
+// lng / lat 均为 BD09；source 取 'default' / 'manual' / 'geocode'
+function setDestPoint(lng, lat, silent, source) {
   destPoint = { lng: lng, lat: lat };
-  const gcj = bd09ToGcj02(lng, lat);
-  if (destMarker) {
-    destMarker.setPosition(gcj);
-  } else {
-    destMarker = new AMap.Marker({ position: gcj, draggable: true, cursor: 'move' });
-    destMarker.on('dragend', function (e) {
-      const bd = gcjToBd(e.lnglat);
-      setDestPoint(bd[0], bd[1], true);
-    });
-    pickMap.add(destMarker);
-  }
-  if (!silent) pickMap.setCenter(gcj);
   document.getElementById('dest_coord').textContent =
       lat.toFixed(4) + ', ' + lng.toFixed(4);
+  // 地图可能没起来（JS API 被拦截 / 加载超时）。此时地址检索依然应该能落点，
+  // 只是没有可视标记——旧版会在 pickMap.add 上抛错，被 catch 成「未找到该地址」，
+  // 明明检索成功却报失败。
+  if (typeof AMap !== 'undefined' && pickMap) {
+    const gcj = bd09ToGcj02(lng, lat);
+    if (destMarker) {
+      destMarker.setPosition(gcj);
+    } else {
+      destMarker = new AMap.Marker({ position: gcj, draggable: true, cursor: 'move' });
+      destMarker.on('dragend', function (e) {
+        const bd = gcjToBd(e.lnglat);
+        setDestPoint(bd[0], bd[1], true, 'manual');
+      });
+      pickMap.add(destMarker);
+    }
+    if (!silent) pickMap.setCenter(gcj);
+  }
+  setDestStatus(source || 'manual');
 }
 
 /**
@@ -363,18 +413,26 @@ async function lookupAddress(address) {
 function geocodeDest() {
   const addr = document.getElementById('dest_addr').value.trim();
   if (!addr) { showErr('请先输入活动点地址'); return; }
-  const tag = document.getElementById('dest_status');
-  tag.className = 'status-tag st-wait';
-  tag.textContent = '检索中...';
+  setDestStatus('searching');
   lookupAddress(addr).then(data => {
-    setDestPoint(data.lng, data.lat);
-    tag.className = 'status-tag st-ok';
-    tag.textContent = '已定位';
+    // 落点与状态一起更新：source='geocode' 会把状态置为「已定位」
+    setDestPoint(data.lng, data.lat, false, 'geocode');
     hideErr();
   }).catch(e => {
-    tag.className = 'status-tag st-fail';
-    tag.textContent = '未找到该地址';
+    setDestStatus('failed');
     console.error('地址检索失败', e);
+  });
+}
+
+/**
+ * 地址框被改动却未重新检索时，落点仍是上一次的结果。
+ * 状态要如实说明，否则用户会以为「地址框里写的就是当前落点」，
+ * 从而拿旧坐标直接提交任务。
+ */
+function bindDestAddrDirty() {
+  document.getElementById('dest_addr').addEventListener('input', function () {
+    if (!destPoint) return;      // 还没落点，保持「待设置」，不要谎报
+    setDestStatus('dirty');
   });
 }
 
@@ -521,9 +579,17 @@ function openConfirm() {
   document.getElementById('cf_depart').textContent =
       document.getElementById('depart_time').value || '未设置';
   const warn = document.getElementById('cf_warn');
+  const warnMsgs = [];
   if (failCount > 0) {
+    warnMsgs.push('有 ' + failCount + ' 个地址定位失败，将不参与本次优化');
+  }
+  if (UNVERIFIED_DEST[destState]) {
+    warnMsgs.push('活动点标注为「' + DEST_STATUS[destState].text +
+                  '」，其坐标未经地址检索确认，请核对后再提交');
+  }
+  if (warnMsgs.length) {
     warn.style.display = 'block';
-    warn.textContent = '有 ' + failCount + ' 个地址定位失败，将不参与本次优化';
+    warn.innerHTML = warnMsgs.join('<br>');
   } else { warn.style.display = 'none'; }
   document.getElementById('confirm_mask').style.display = 'block';
 }
@@ -647,6 +713,35 @@ function timelineHTML(v, isDrop) {
   return html;
 }
 
+function paxTableHTML(v, isDrop) {
+  const ps = v.passengers || [];
+  if (!ps.length) return '';
+  let rows = '';
+  ps.forEach(p => {
+    const rideMin = Math.round(p.ride_duration_s / 60);
+    const incMin = Math.round(p.increase_duration_s / 60);
+    const incTxt = incMin > 0 ? ('+' + incMin + ' 分') : '—';
+    const ratioTxt = p.detour_ratio ? ('（×' + p.detour_ratio + '）') : '';
+    const warn = p.warning
+        ? '<span class="pax-warn" title="实际乘车超过 80 分钟或绕行比例超过 1.3">明显绕路</span>'
+        : '';
+    rows += '<tr>' +
+      '<td class="pax-seq">' + p.sequence_no + '</td>' +
+      '<td>' + p.name + '</td>' +
+      '<td class="pax-cost">¥' + p.allocated_cost.toFixed(2) + '</td>' +
+      '<td>' + rideMin + ' 分</td>' +
+      '<td class="pax-inc' + (incMin > 0 ? '' : ' zero') + '">' + incTxt + ratioTxt + '</td>' +
+      '<td>' + warn + '</td>' +
+      '</tr>';
+  });
+  const head = isDrop ? '送达序' : '上车序';
+  return '<table class="pax-table">' +
+    '<thead><tr><th>' + head + '</th><th>姓名</th><th>分摊</th><th>实际乘车</th>' +
+    '<th>较直达</th><th></th></tr></thead>' +
+    '<tbody>' + rows + '</tbody></table>' +
+    '<div class="pax-foot">车费合计 ¥' + v.cost + '，分摊已含尾差（由第 1 位承担）</div>';
+}
+
 function showResult(result) {
   document.getElementById('result_card').style.display = 'block';
   document.getElementById('map_card').style.display = 'block';
@@ -674,6 +769,7 @@ function showResult(result) {
         </div>
         <div class="order-line">${orderLine}</div>
         ${timelineHTML(v, isDrop)}
+        ${paxTableHTML(v, isDrop)}
       </div>`;
   });
   setTimeout(() => initMap(result), 100);
@@ -699,6 +795,15 @@ function resultText() {
       out += '  ' + fmtTime(t) + '  ' + c.name + (addr ? '（' + addr + '）' : '') + '\n';
       if (i < v.coordinates.length - 1 && legs[i] != null) t += legs[i];
     });
+    (v.passengers || []).forEach(p => {
+      const rideMin = Math.round(p.ride_duration_s / 60);
+      const incMin = Math.round(p.increase_duration_s / 60);
+      out += '  分摊：' + p.name + ' ¥' + p.allocated_cost.toFixed(2) +
+             '（实际乘车 ' + rideMin + ' 分钟' +
+             (incMin > 0 ? '，较直达多 ' + incMin + ' 分钟' : '') +
+             (p.warning ? '，明显绕路' : '') + '）\n';
+    });
+    out += '  车费合计 ¥' + v.cost + '（分摊已含尾差，由第 1 位承担）\n';
   });
   return out;
 }
@@ -727,16 +832,32 @@ function exportCSV() {
   const r = currentResult;
   if (!r) return;
   const isDrop = r.direction === 'dropoff';
-  const rows = [['车号', '顺序', '姓名', '地址', '预计时刻', '里程km', '时长分钟', '费用元']];
+  const rows = [['车号', '路线顺序', '姓名', '地址', '预计时刻', '分摊元',
+                 '个人乘车分钟', '直达分钟', '较直达分钟', '绕行比例', '绕路预警',
+                 '里程km', '时长分钟', '费用元']];
   const start = parseTime(document.getElementById('depart_time').value);
   r.vehicles.forEach(v => {
     const legs = v.leg_durations || [];
+    // 乘客允许重名，故按出现顺序用队列一一对应，避免错配
+    const queues = {};
+    (v.passengers || []).forEach(p => { (queues[p.name] = queues[p.name] || []).push(p); });
+    const take = name => (queues[name] && queues[name].length) ? queues[name].shift() : null;
     let t = start;
     v.coordinates.forEach((c, i) => {
-      rows.push([v.vehicle_id, i + 1, c.name, addrOf(c.name), fmtTime(t)]);
+      const p = take(c.name);
+      rows.push([
+        v.vehicle_id, i + 1, c.name, addrOf(c.name), fmtTime(t),
+        p ? p.allocated_cost.toFixed(2) : '',
+        p ? Math.round(p.ride_duration_s / 60) : '',
+        p ? Math.round(p.direct_duration_s / 60) : '',
+        p ? Math.round(p.increase_duration_s / 60) : '',
+        (p && p.detour_ratio != null) ? p.detour_ratio : '',
+        (p && p.warning) ? '明显绕路' : ''
+      ]);
       if (i < v.coordinates.length - 1 && legs[i] != null) t += legs[i];
     });
-    rows.push([v.vehicle_id, '合计', '', '', '', v.distance_km, v.duration_min, v.cost]);
+    rows.push([v.vehicle_id, '合计', '', '', '', v.cost, '', '', '', '', '',
+               v.distance_km, v.duration_min, v.cost]);
   });
   const csv = '\uFEFF' + rows.map(row =>
     row.map(cell => {
@@ -934,9 +1055,14 @@ if (location.protocol === 'file:') {
 
 function boot() {
   // 每一步独立兜底：地图初始化失败不应连带影响名单加载等功能
+  setDestStatus('pending');   // 显式声明「还没落点」，与 destPoint=null 保持一致
   try { initBaseMap(); } catch (e) { console.error('主地图初始化失败', e); }
-  try { initPickMap(); } catch (e) { console.error('选点地图初始化失败', e); }
+  try { initPickMap(); } catch (e) {
+    console.error('选点地图初始化失败', e);
+    setDestStatus('noMap');   // 没地图就没法选点，状态如实反映，不留假「已定位」
+  }
   try { setDirection('pickup'); } catch (e) { console.error(e); }
+  try { bindDestAddrDirty(); } catch (e) { console.error(e); }
   try { loadDemo(); } catch (e) { console.error('示例名单加载失败', e); }
 }
 
@@ -952,6 +1078,8 @@ function boot() {
       else if (tries > 50) {
         clearInterval(timer);
         showErr('高德地图 JS API 加载超时，请检查网络连接或 Key 配置');
+        // 地图没起来就不可能选点，状态如实标注，不要停留在含糊的「待设置」
+        try { setDestStatus('noMap'); } catch (_) {}
       }
     }, 200);
     return;

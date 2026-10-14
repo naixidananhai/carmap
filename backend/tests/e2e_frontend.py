@@ -12,17 +12,53 @@
      （对比"未转换直接用 BD09"的偏移量，验证转换确实生效）
 """
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
 
 EDGE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 URL = "http://localhost:8000/"
-DEBUG_PORT = 9333
+
+
+def free_port():
+    """取一个当前空闲的本地端口，避免与上一轮遗留的 Edge 调试端口碰撞。
+    曾因固定 9333 被上一轮残留进程占着，新 Edge 抢不到端口、CDP 连上了旧实例的
+    陈旧页面（那页早已跑完第 4 节、destPoint 被改成检索结果），导致「活动点已设为
+    郑州东站」间歇性误报失败。"""
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+DEBUG_PORT = free_port()
+# 每次运行用独立配置目录，避免 Edge 单实例机制把 URL 交给上一轮的旧实例进程
+PROFILE_DIR = os.path.join(tempfile.gettempdir(), f"edge_carmap_verify_{os.getpid()}")
 
 results = []
+
+
+def kill_edge_tree(pid):
+    """按配置目录彻底清理 Edge 进程树。
+
+    Edge 启动进程常会退化为 launcher 后自行退出，真实浏览器进程另有 PID，
+    因此仅 taskkill <pid> 不足以清理，必须按命令行里的 profile 目录兜底匹配。
+    残留进程会占住调试端口，污染下一次运行。
+    """
+    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
+          f"Where-Object {{ $_.CommandLine -like '*{PROFILE_DIR}*' }} | "
+          "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def check(name, ok, detail=""):
@@ -108,7 +144,7 @@ def main():
         "--remote-allow-origins=*",
         "--no-first-run", "--no-default-browser-check",
         "--disable-gpu", "--window-size=1440,1000",
-        "--user-data-dir=C:/Temp/edge_carmap_verify",
+        f"--user-data-dir={PROFILE_DIR}",
         URL,
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -143,6 +179,34 @@ def main():
 
         version = evaluate(send, "typeof AMap !== 'undefined' ? AMap.version : null")
         check("AMap 版本可读", bool(version), version or "N/A")
+
+        # 守卫：确认连上的是「本次新启动」的页面，而不是上一轮遗留实例的陈旧页面。
+        # 陈旧页面的典型特征是已经跑完过完整流程（currentResult 非空、destPoint 已被
+        # 地址检索覆盖）。若不先拦住，后续断言会出现难以定位的误报。
+        fresh = evaluate(send, """(() => {
+          const d = destPoint;
+          const tag = document.getElementById('dest_status');
+          return {
+            hasResult: typeof currentResult !== 'undefined' && !!currentResult,
+            submitted: typeof TASK_ID !== 'undefined' && !!TASK_ID,
+            destDefault: !!d && Math.abs(d.lng - 113.7536) < 1e-9 && Math.abs(d.lat - 34.7421) < 1e-9,
+            destTag: tag ? tag.textContent : null,
+            destCoord: document.getElementById('dest_coord').textContent
+          };
+        })()""") or {}
+        stale = fresh.get("hasResult") or fresh.get("submitted") or not fresh.get("destDefault")
+        check("连到的是全新加载的页面（无上一轮残留状态）", not stale,
+              f"hasResult={fresh.get('hasResult')}, destDefault={fresh.get('destDefault')}")
+        if stale:
+            print("  !! 疑似连上了遗留实例的陈旧页面，本次结果不可信，直接中止")
+            return
+
+        # 回归守卫：初始状态不得谎报「已定位」。
+        # 旧版把 dest_status 硬编码成 st-ok/已定位 + 写死坐标，但加载时根本没调用过
+        # /api/geocode；用户会以为坐标是检索出来的。默认点必须标记为「默认点」。
+        check("初始状态未谎报「已定位」（默认点须如实标注）",
+              fresh.get("destTag") == "默认点",
+              f'初始 dest_status={fresh.get("destTag")!r}, coord={fresh.get("destCoord")!r}')
 
         # 主地图容器初始 display:none，canvas 尺寸此时为 0，
         # 因此这里只校验小地图（pick_map 一直可见），主地图在提交任务后再验
@@ -205,6 +269,22 @@ def main():
             check("地图中心已做 GCJ-02 转换（与 BD09 差约 700m）", off > 0.003,
                   f'中心 lng {pick["center"][0]:.4f} vs BD09 {pick["dest"][0]:.4f}, '
                   f'偏移 {off * 111320 * 0.85:.0f}m')
+
+        # 地址框被改动却没重新检索时，落点仍是旧坐标——状态必须如实提示，
+        # 否则用户会以为「地址框里写的就是当前落点」而直接提交
+        def _type(addr):
+            evaluate(send, """(() => {
+              const inp = document.getElementById('dest_addr');
+              const setter = Object.getOwnPropertyDescriptor(
+                  HTMLInputElement.prototype, 'value').set;
+              setter.call(inp, %s);
+              inp.dispatchEvent(new Event('input', {bubbles: true}));
+            })()""" % json.dumps(addr, ensure_ascii=False))
+
+        _type('二七广场')
+        dirty_tag = evaluate(send, "document.getElementById('dest_status').textContent")
+        check("地址改动未检索时状态转为「地址已改」", dirty_tag == "地址已改", repr(dirty_tag))
+        _type('郑州东站')   # 还原，交由第 4 节点「检索」走完整流程
 
         print("\n=== 4. 地址检索（高德 Geocoder）===")
         evaluate(send, """(() => {
@@ -288,6 +368,40 @@ def main():
               f'{res["timeline"]} 个时间线节点')
         print(f'       总费用 ¥{res["totalCost"]}，下降率 {res["rate"]}%')
 
+        # 6b. 乘客分摊明细（A1 费用分摊 + 个人乘车时间）
+        pax = evaluate(send, """(() => {
+          const r = currentResult;
+          const rows = Array.from(document.querySelectorAll('.pax-table tbody tr'));
+          const parsed = rows.map(tr => {
+            const tds = tr.querySelectorAll('td');
+            return { seq: parseInt(tds[0].textContent, 10),
+                     cost: parseFloat(tds[2].textContent.replace('¥', '')) };
+          });
+          const r2 = x => Math.round(x * 100) / 100;
+          return {
+            tables: document.querySelectorAll('.pax-table').length,
+            feet: document.querySelectorAll('.pax-foot').length,
+            rows: parsed.length,
+            firstSeq: parsed.length ? parsed[0].seq : null,
+            anyCost: parsed.filter(p => p.cost > 0).length,
+            sums: (r.vehicles || []).map(v => r2((v.passengers || []).reduce((s, p) => s + p.allocated_cost, 0))),
+            costs: (r.vehicles || []).map(v => r2(v.cost)),
+            paxTotal: (r.vehicles || []).reduce((s, v) => s + (v.passengers || []).length, 0)
+          };
+        })()""") or {}
+        n_veh = (res or {}).get("vehicles", 0)
+        check("乘客分摊明细表数量与车数一致", pax.get("tables") == n_veh,
+              f'{pax.get("tables")} 表 / {n_veh} 车')
+        check("每辆车分摊金额合计等于该车车费", pax.get("sums") == pax.get("costs"),
+              f'{pax.get("sums")} vs {pax.get("costs")}')
+        check("分摊明细行数等于乘客总数",
+              pax.get("rows", 0) > 0 and pax.get("rows") == pax.get("paxTotal"),
+              f'{pax.get("rows")} 行 / {pax.get("paxTotal")} 人')
+        check("分摊金额已渲染为金额文本", pax.get("anyCost", 0) > 0,
+              f'{pax.get("anyCost")} 行含金额')
+        check("每车均有分摊脚注（尾差说明）", pax.get("feet") == n_veh,
+              f'{pax.get("feet")} 条脚注')
+
         # 检查高德覆盖物是否真的画到地图上。
         # 注意：高德 2.0 默认用 WebGL 渲染，canvas.getContext('2d') 拿不到像素，
         # 因此改用「覆盖物数量 + 折线点数」这类可测量的接口状态来判断。
@@ -358,16 +472,56 @@ def main():
             out.write_bytes(__import__("base64").b64decode(shot["data"]))
             print(f"\n截图已保存: {out}")
 
+        # 8. 降级路径：地图不可用时，地址检索仍应能落点。
+        #    旧版 setDestPoint 会直接 pickMap.add / pickMap.setCenter，
+        #    地图缺失时抛异常 → 被 geocodeDest 的 catch 吞掉 → 明明检索成功
+        #    却显示「未找到该地址」。修复后应只跳过标记绘制，坐标照常写入。
+        #    注意：本节会临时把 pickMap 置空，因此放在截图之后，并在 finally 里还原。
+        print("\n=== 8. 降级路径：地图缺失时地址检索仍能落点 ===")
+        pre = evaluate(send, """(() => ({
+          hasMap: typeof pickMap !== 'undefined' && !!pickMap,
+          tag: document.getElementById('dest_status').textContent
+        }))()""") or {}
+        check("前置条件：pickMap 已初始化", bool(pre.get("hasMap")), str(pre))
+
+        evaluate(send, """(() => {
+          window.__savedPickMap = pickMap;
+          window.__savedDestMarker = destMarker;
+          pickMap = null; destMarker = null;          // 模拟高德 JS API 加载失败
+          document.getElementById('dest_addr').value = '郑州东站';
+        })()""")
+        try:
+            evaluate(send, "geocodeDest()")
+            geo2 = {}
+            for _ in range(25):
+                geo2 = evaluate(send, """(() => ({
+                  tag: document.getElementById('dest_status').textContent,
+                  pt: destPoint ? [destPoint.lng, destPoint.lat] : null
+                }))()""") or {}
+                if geo2.get("tag") in ("已定位", "未找到该地址"):
+                    break
+                time.sleep(0.5)
+            check("无地图时地址检索仍报「已定位」（不再误判为未找到）",
+                  geo2.get("tag") == "已定位", f'status={geo2.get("tag")!r}')
+            pt = geo2.get("pt")
+            check("无地图时仍写入了合法坐标",
+                  bool(pt) and abs(pt[0] - 113.7536) < 0.1 and abs(pt[1] - 34.7421) < 0.1,
+                  str(pt))
+        finally:
+            evaluate(send, "pickMap = window.__savedPickMap; "
+                           "destMarker = window.__savedDestMarker;")
+
     finally:
         try:
             ws.close()
         except Exception:
             pass
-        proc.terminate()
+        kill_edge_tree(proc.pid)
         try:
             proc.wait(timeout=8)
         except Exception:
             proc.kill()
+        shutil.rmtree(PROFILE_DIR, ignore_errors=True)
 
     print("\n" + "=" * 56)
     passed = sum(1 for _, ok, _ in results if ok)

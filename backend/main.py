@@ -16,7 +16,8 @@ from pydantic import BaseModel
 from fastapi import FastAPI, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from optimizer import Passenger, DistanceMatrix, optimize
+from optimizer import (Passenger, DistanceMatrix, optimize,
+                       allocate_cost, detour_warning, DETOUR_WARNING)
 from map_provider import create_provider
 
 app = FastAPI(title="拼车路线优化系统", version="1.1")
@@ -83,6 +84,20 @@ class TaskCreate(BaseModel):
     time_budget_s: int = 10
     max_vehicles: Optional[int] = None  # 车数上限硬约束（可选）
     direction: str = "pickup"  # pickup=集合接人 / dropoff=散场送人
+class PassengerDetailOut(BaseModel):
+    """
+    乘客个人乘车明细（对齐设计文档《数据库设计 V1.1》route_passenger 表）。
+    时长统一用**整数秒**（设计口径：内部按秒判定、展示再换算分钟），
+    字段名加 _s 后缀以区别于本响应中既有的分钟制字段（如 leg_durations）。
+    """
+    name: str
+    sequence_no: int                     # 沿最终路线的访问顺序（1 起）：集合=上车顺序，散场=送达顺序
+    direct_duration_s: int               # 起点直达终点的标准秒数（不拼车）
+    ride_duration_s: int                 # 从本上车点到终点的实际乘车秒数
+    increase_duration_s: int             # ride - direct
+    detour_ratio: Optional[float] = None  # ride / direct；direct 为 0 时无定义
+    allocated_cost: float                 # 本车分摊金额（已含尾差）
+    warning: Optional[str] = None         # DETOUR_WARNING / None
 
 
 class VehicleOut(BaseModel):
@@ -92,6 +107,7 @@ class VehicleOut(BaseModel):
     coordinates: List[dict] = []  # 接人顺序的坐标 [{lat, lng, name}, ...]
     path: List[dict] = []  # 沿真实路网的折线点 [{lat, lng}, ...]，为空时前端降级为直线
     leg_durations: List[float] = []  # 每段耗时（分钟），与 coordinates 顺序对应，供前端时间线累加
+    passengers: List[PassengerDetailOut] = []  # 个人乘车明细 + 分摊金额（与 order 同序）
     distance_km: float
     duration_min: float
     cost: float
@@ -229,6 +245,16 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
         # 乘客 id -> 距离矩阵下标；终点固定在矩阵最后一位
         idx_map = {p.id: i for i, p in enumerate(passengers)}
         dest_idx = len(passengers)
+
+        def _matrix_secs(a: int, b: int):
+            """取 a→b 的耗时（秒）。散场时 dm 是转置矩阵（段是反向边），故优先用转置前的正向矩阵"""
+            if fwd_matrix is not None and fwd_matrix[a][b] is not None:
+                return float(fwd_matrix[a][b][1])
+            return float(dm.get(a, b)[1])  # Haversine 降级（对称，方向无关）
+
+        def _stop_index(p) -> Optional[int]:
+            return dest_idx if p.id == "DEST" else idx_map.get(p.id)
+
         vehicles_out = []
         for i, v in enumerate(best):
             # optimize 输出的 order 是「接人」语义：首站 → ... → 活动点。
@@ -245,20 +271,48 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
                 stops = seq + [dest]
             # 按需拼接沿真实路网的折线（provider 内部有缓存，重复段不重复计费）
             path_pts = build_vehicle_path(provider, stops, idx_map, dest_idx, all_points)
-            # 每段耗时（分钟），与 coordinates 顺序对应，供前端时间线累加。
-            # 散场时 fwd_matrix 是转置前的原始矩阵——转置矩阵的段是反向边，耗时不符
-            legs = []
+            # 每段耗时，与 stops / coordinates 顺序对应（leg_secs[k] = stops[k] → stops[k+1]）
+            leg_secs = []
             for k in range(1, len(stops)):
-                a = dest_idx if stops[k-1].id == "DEST" else idx_map.get(stops[k-1].id)
-                b = dest_idx if stops[k].id == "DEST" else idx_map.get(stops[k].id)
+                a, b = _stop_index(stops[k - 1]), _stop_index(stops[k])
                 if a is None or b is None:
-                    legs = []
+                    leg_secs = []
                     break
-                if fwd_matrix and fwd_matrix[a][b] is not None:
-                    dur = fwd_matrix[a][b][1]
-                else:
-                    dur = dm.get(a, b)[1]  # Haversine 降级
-                legs.append(round(dur / 60.0, 1))
+                leg_secs.append(_matrix_secs(a, b))
+            legs = [round(s / 60.0, 1) for s in leg_secs]  # 分钟制，供前端时间线累加
+
+            # 每人分摊金额（与 seq 同序，尾差归沿路线第一位）
+            alloc = allocate_cost(v.cost, len(seq))
+            alloc_by_pid = {p.id: alloc[j] for j, p in enumerate(seq)}
+
+            # 个人乘车明细：t_ride(i) = 从该乘客上车点到终点的逐段累加。
+            # 集合模式乘客在自家上车 → 本段及其之后所有段（leg_secs[i:]）；
+            # 散场模式乘客在活动点上车 → 本段之前所有段（leg_secs[:i]）。
+            passengers_out = []
+            for k, p in enumerate(stops):
+                if p.id == "DEST":
+                    continue  # 终点 / 活动点本身不是乘客
+                ride_s = (sum(leg_secs[k:]) if not is_dropoff else sum(leg_secs[:k])) \
+                    if leg_secs else 0.0
+                # 直达时间取「物理方向」的正向矩阵：集合=家→活动点，散场=活动点→家
+                pi = idx_map.get(p.id)
+                direct_s = 0.0
+                if pi is not None:
+                    direct_s = _matrix_secs(pi, dest_idx) if not is_dropoff \
+                        else _matrix_secs(dest_idx, pi)
+                increase_s = ride_s - direct_s
+                passengers_out.append(PassengerDetailOut(
+                    name=p.name,
+                    # 集合：stops=[p0..pk, 终点] → 序号 = k+1；散场：stops=[活动点, h0..hk] → 序号 = k
+                    sequence_no=(k + 1) if not is_dropoff else k,
+                    direct_duration_s=int(round(direct_s)),
+                    ride_duration_s=int(round(ride_s)),
+                    increase_duration_s=int(round(increase_s)),
+                    detour_ratio=round(ride_s / direct_s, 2) if direct_s > 0 else None,
+                    allocated_cost=alloc_by_pid.get(p.id, 0.0),
+                    warning=detour_warning(ride_s, direct_s),
+                ))
+
             vehicles_out.append(VehicleOut(
                 vehicle_id=f"V{i+1:02d}",
                 passenger_count=len(v.passengers),
@@ -266,6 +320,7 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
                 coordinates=coords,
                 path=[{"lat": p[1], "lng": p[0]} for p in path_pts],
                 leg_durations=legs,
+                passengers=passengers_out,
                 distance_km=round(v.distance_m / 1000, 1),
                 duration_min=round(v.duration_s / 60, 1),
                 cost=round(v.cost, 2),

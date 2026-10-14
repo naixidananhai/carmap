@@ -31,6 +31,11 @@ MAX_ROUTE_SECONDS = 5400
 CAR_CAPACITY = 6  # 最大容量
 AVG_SPEED_KMH = 30.0  # Haversine 回退时用
 
+# 绕路预警阈值（业务需求 §第五节）：满足任一即标注「明显绕路」
+DETOUR_RIDE_LIMIT_S = 80 * 60   # 实际乘车时长 > 80 分钟
+DETOUR_RATIO_LIMIT = 1.3        # 绕行比例 ride / direct > 1.3
+DETOUR_WARNING = "DETOUR_WARNING"
+
 
 @dataclass
 class Passenger:
@@ -104,6 +109,43 @@ class DistanceMatrix:
 def calc_cost(distance_m: float) -> float:
     km = distance_m / 1000.0
     return BASE_FEE + PER_KM_FEE * max(km - FREE_KM, 0)
+
+
+def allocate_cost(total_cost: float, n: int) -> List[float]:
+    """
+    本车费用按同乘人数平摊，返回与「接人顺序」同序的分摊金额列表。
+
+    规则（设计文档《技术方案设计 V1.1》§十一，确定性、可复现、可审计）：
+      1. 本车费用先按全精度除以同乘人数，得到每人精确分摊值；
+      2. 展示时统一四舍五入到 2 位小数；
+      3. 四舍五入后产生的尾差由**接人顺序排在第一位的乘客**承担。
+
+    例：100 元 / 3 人 → [33.34, 33.33, 33.33]（第一位承担 +0.01）
+    不变式：sum(返回值) 恒等于 round(total_cost, 2)，即分摊不产生金额损失或凭空多出。
+
+    注：散场模式下并无「上车顺序」（所有人在活动点同时上车），
+    此时「第一位」取沿最终路线的访问顺序第一位（即第一位被送达的乘客），
+    保持规则确定性，详见 v1.1/A1 费用分摊与个人乘车明细实现说明.md。
+    """
+    if n <= 0:
+        return []
+    target = round(float(total_cost), 2)
+    exact = target / n
+    base = round(exact, 2)
+    alloc = [base] * n
+    # 尾差 = 目标总额 − 已分配总额（四舍五入带来，通常 ±0.01 量级）
+    remainder = round(target - base * n, 2)
+    alloc[0] = round(base + remainder, 2)
+    return alloc
+
+
+def detour_warning(ride_s: float, direct_s: float) -> Optional[str]:
+    """绕路预警：实际乘车 > 80 分钟，或绕行比例 > 1.3（任一满足即预警）"""
+    if ride_s > DETOUR_RIDE_LIMIT_S:
+        return DETOUR_WARNING
+    if direct_s > 0 and ride_s / direct_s > DETOUR_RATIO_LIMIT:
+        return DETOUR_WARNING
+    return None
 
 
 # ============ DBSCAN 聚类 ============
