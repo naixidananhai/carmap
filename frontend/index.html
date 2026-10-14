@@ -123,14 +123,19 @@
           <p class="field-label">优化模式</p>
           <select class="text-input" id="opt_mode">
             <option value="cost">费用最优</option>
-            <option value="balanced">时间均衡</option>
             <option value="fewest_vehicles">车辆最少</option>
           </select>
+          <p style="font-size:11px; color:#c0c4cc; margin:4px 0 0;">「时间均衡」模式已下线（实测与「费用最优」结果无差异）</p>
+        </div>
+        <div style="margin-bottom:14px;">
+          <p class="field-label">车辆上限（可选）</p>
+          <input class="text-input" id="max_vehicles" type="number" min="1" placeholder="不限">
+          <p style="font-size:11px; color:#c0c4cc; margin:4px 0 0;">硬约束：车数不超过此值，再求最省费用</p>
         </div>
         <div style="margin-bottom:14px;">
           <p class="field-label">求解预算（秒）</p>
           <input class="text-input" id="time_budget" type="number" value="10" min="5" max="300">
-          <p style="font-size:11px; color:#c0c4cc; margin:4px 0 0;">算得越久越省，60 秒后收益递减</p>
+          <p style="font-size:11px; color:#c0c4cc; margin:4px 0 0;">算得越久越省，10 秒后收益递减</p>
         </div>
         <div>
           <p class="field-label" id="depart_label">预计出发时间</p>
@@ -544,6 +549,9 @@ async function submitTask() {
   }, 1000);
 
   try {
+    // 车辆上限：留空表示不限；填了必须是 >=1 的整数
+    const mvRaw = document.getElementById('max_vehicles').value.trim();
+    const maxVehicles = mvRaw === '' ? null : Math.max(1, parseInt(mvRaw, 10) || 1);
     const resp = await fetch('/api/tasks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -553,6 +561,7 @@ async function submitTask() {
         dest_lng: destPoint.lng,
         mode: document.getElementById('opt_mode').value,
         time_budget_s: parseInt(document.getElementById('time_budget').value),
+        max_vehicles: maxVehicles,
         direction: currentDirection
       })
     });

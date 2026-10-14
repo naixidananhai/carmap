@@ -45,6 +45,24 @@ async def read_index():
 # 内存存储任务（V1.1 单机，后续可换 SQLite）
 TASKS = {}
 
+# 支持的优化模式。V1.1 原设计的 balanced（加权和）已删除：
+# P1 实测其 cost 项占最终 score 约 76%，产出与 cost 无系统差异（费用仅差 +1.00%），
+# 属冗余模式。旧客户端仍传 balanced 时静默映射为 cost，避免破坏兼容。
+VALID_MODES = ("cost", "fewest_vehicles")
+MODE_ALIASES = {"balanced": "cost"}
+
+
+def normalize_mode(mode: Optional[str]) -> str:
+    m = (mode or "cost").strip().lower()
+    if m in MODE_ALIASES:
+        print(f"  [mode] {m!r} 已废弃（P1 验证为冗余模式），自动映射为 "
+              f"{MODE_ALIASES[m]!r}")
+        return MODE_ALIASES[m]
+    if m not in VALID_MODES:
+        print(f"  [mode] {m!r} 未知，回退默认 'cost'")
+        return "cost"
+    return m
+
 
 # ============ 数据模型 ============
 class PassengerIn(BaseModel):
@@ -59,8 +77,11 @@ class TaskCreate(BaseModel):
     dest_address: Optional[str] = None
     dest_lat: float
     dest_lng: float
-    mode: str = "cost"  # cost / balanced / fewest_vehicles
-    time_budget_s: int = 60
+    mode: str = "cost"  # cost / fewest_vehicles（旧值 balanced 会自动映射到 cost）
+    # 10 秒与前端默认一致。P1 实测（见 v1.1/P1 ALNS 真实收益验证报告）：n≤30 在 1 秒后
+    # 质量即饱和，n=45 时 4s→60s（13.7 倍迭代）只再省 4.3% 费用，默认取 10s 兼顾等待体验
+    time_budget_s: int = 10
+    max_vehicles: Optional[int] = None  # 车数上限硬约束（可选）
     direction: str = "pickup"  # pickup=集合接人 / dropoff=散场送人
 
 
@@ -87,6 +108,7 @@ class TaskResult(BaseModel):
     vehicle_count: int
     vehicles: List[VehicleOut]
     error: Optional[str] = None
+    warning: Optional[str] = None  # 例如「车数上限未能满足」
 
 
 # ============ 后台优化任务 ============
@@ -136,7 +158,8 @@ def build_vehicle_path(provider, stops, idx_map, dest_idx, all_points):
 
 def run_optimization(task_id: str, passengers_in: List[PassengerIn],
                      dest_lat: float, dest_lng: float,
-                     mode: str, time_budget_s: int, direction: str = "pickup"):
+                     mode: str, time_budget_s: int, direction: str = "pickup",
+                     max_vehicles: Optional[int] = None):
     try:
         TASKS[task_id]["status"] = "RUNNING"
         TASKS[task_id]["stage"] = "matrix"
@@ -187,8 +210,19 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
         dm = DistanceMatrix(all_points, baidu_matrix=baidu_matrix)
 
         # 跑优化（stage_cb 把 初始解/ALNS 阶段推给前端进度条）
+        diag = {}
         best, baseline = optimize(passengers, dest, dm, mode=mode, time_budget_s=time_budget_s,
-                                  stage_cb=lambda s: TASKS[task_id].update(stage=s))
+                                  stage_cb=lambda s: TASKS[task_id].update(stage=s),
+                                  max_vehicles=max_vehicles, diag=diag)
+        warning = None
+        missed = diag.get("constraint_missed")
+        clamped = diag.get("capacity_clamped")
+        if missed:
+            warning = (f"车数上限 {missed['requested']} 辆未能满足，"
+                       f"实际 {missed['actual']} 辆（受单车 90 分钟时长约束或地理分散限制）")
+        elif clamped:
+            warning = (f"车数上限 {clamped['requested']} 辆低于满载下限，"
+                       f"已按 {clamped['raised_to']} 辆计算")
 
         # 组装结果
         total_cost = sum(v.cost for v in best)
@@ -247,6 +281,7 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
             saving_rate=round((baseline - total_cost) / baseline * 100, 1) if baseline > 0 else 0,
             vehicle_count=len(best),
             vehicles=vehicles_out,
+            warning=warning,
         )
         TASKS[task_id]["status"] = "DONE"
         TASKS[task_id]["stage"] = "done"
@@ -304,6 +339,7 @@ def api_geocode(address: str = Query(..., min_length=1), city: str = "郑州市"
 def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
     task_id = str(uuid.uuid4())[:8]
     direction = req.direction if req.direction in ("pickup", "dropoff") else "pickup"
+    mode = normalize_mode(req.mode)
     TASKS[task_id] = {
         "task_id": task_id,
         "status": "PENDING",
@@ -314,7 +350,7 @@ def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
     }
     background_tasks.add_task(
         run_optimization, task_id, req.passengers,
-        req.dest_lat, req.dest_lng, req.mode, req.time_budget_s, direction
+        req.dest_lat, req.dest_lng, mode, req.time_budget_s, direction, req.max_vehicles
     )
     return {"task_id": task_id, "status": "PENDING"}
 
