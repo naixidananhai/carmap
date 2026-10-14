@@ -186,8 +186,8 @@ CREATE TABLE IF NOT EXISTS solution (
     total_distance  INTEGER,
     total_duration  INTEGER,
     vehicle_count   INTEGER,
-    four_seat_count INTEGER DEFAULT 0,
-    six_seat_count  INTEGER DEFAULT 0,
+    four_seat_count INTEGER DEFAULT 0,   -- A2：4 座车辆数（按实际载客 ≤4 派车）
+    six_seat_count  INTEGER DEFAULT 0,   -- A2：6 座车辆数（载客 5~6 必为 6 座）
     baseline_cost   REAL,
     saving_rate     REAL,
     is_best         INTEGER NOT NULL DEFAULT 1,
@@ -203,7 +203,7 @@ CREATE TABLE IF NOT EXISTS vehicle_route (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     solution_id     INTEGER NOT NULL REFERENCES solution(id) ON DELETE CASCADE,
     vehicle_no      TEXT    NOT NULL,
-    vehicle_type    INTEGER DEFAULT 6,
+    vehicle_type    INTEGER DEFAULT 6,                  -- A2：车型 4 / 6 座
     distance_meter  INTEGER,
     duration_second INTEGER,
     cost            REAL,
@@ -430,6 +430,17 @@ def save_solution(task_id: int, job_id: Optional[int], result: Dict[str, Any]) -
         total_distance += float(v.get("distance_km") or 0) * 1000
         total_duration += float(v.get("duration_min") or 0) * 60
 
+    # A2 车型：以 optimize 派定的车型为准（= 按各车实际载客数派车）。
+    # 缺字段时（老客户端 / 老结果）按「载客 5~6 为 6 座、其余 6 座」兜底，
+    # 即退化为 A2 之前的「全 6 座」口径，不会凭空造出 4 座车。
+    vtypes = [int(v.get("vehicle_type") or 6) for v in vehicles]
+    four_cnt = result.get("four_seat_count")
+    six_cnt = result.get("six_seat_count")
+    if four_cnt is None:
+        four_cnt = sum(1 for t in vtypes if t == 4)
+    if six_cnt is None:
+        six_cnt = sum(1 for t in vtypes if t == 6)
+
     _execute("UPDATE solution SET is_best = 0 WHERE task_id = ?", (task_id,))
     cur = _execute(
         """INSERT INTO solution
@@ -440,7 +451,7 @@ def save_solution(task_id: int, job_id: Optional[int], result: Dict[str, Any]) -
         (task_id, job_id, 3,  # version 3 = 最终方案（V1 初始 / V2 优化 / V3 最终）
          result.get("total_cost"), int(round(total_distance)),
          int(round(total_duration)), result.get("vehicle_count"),
-         0, result.get("vehicle_count"),          # V1.0 车型固定 6 座（A2 未实现）
+         int(four_cnt), int(six_cnt),
          result.get("baseline_cost"), result.get("saving_rate"),
          "COMPLETED", result.get("direction"), result.get("warning"), now_iso()))
     solution_id = cur.lastrowid if cur is not None else None
@@ -450,14 +461,14 @@ def save_solution(task_id: int, job_id: Optional[int], result: Dict[str, Any]) -
     conn = get_conn()
     try:
         with conn:
-            for v in vehicles:
+            for v, vt in zip(vehicles, vtypes):
                 vcur = conn.execute(
                     """INSERT INTO vehicle_route
                        (solution_id, vehicle_no, vehicle_type, distance_meter,
                         duration_second, cost, polyline, route_order,
                         coordinates, leg_durations, valid)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                    (solution_id, v.get("vehicle_id"), 6,
+                    (solution_id, v.get("vehicle_id"), vt,
                      int(round(float(v.get("distance_km") or 0) * 1000)),
                      int(round(float(v.get("duration_min") or 0) * 60)),
                      v.get("cost"),
@@ -521,6 +532,8 @@ def load_result(task_code: str, job: Optional[Dict[str, Any]] = None
             (v["id"],))
         vehicles.append({
             "vehicle_id": v["vehicle_no"],
+            # A2：车型（4 / 6 座）。老库该列为 NULL 时退化为 6 座
+            "vehicle_type": v["vehicle_type"] or 6,
             "passenger_count": len(prows),
             "order": json.loads(v["route_order"] or "[]"),
             "coordinates": json.loads(v["coordinates"] or "[]"),
@@ -554,6 +567,11 @@ def load_result(task_code: str, job: Optional[Dict[str, Any]] = None
         "savings": round((sol["baseline_cost"] or 0) - (sol["total_cost"] or 0), 2),
         "saving_rate": sol["saving_rate"],
         "vehicle_count": sol["vehicle_count"],
+        # A2：车型统计随方案一起恢复；老库为 NULL 时按 vehicle_count 全 6 座兜底
+        "four_seat_count": sol["four_seat_count"] or 0,
+        "six_seat_count": (sol["six_seat_count"]
+                           if sol["six_seat_count"] is not None
+                           else sol["vehicle_count"] or 0),
         "vehicles": vehicles,
         "error": None,
         "warning": sol["warning"],
@@ -579,11 +597,12 @@ def list_tasks(limit: int = 20) -> List[Dict[str, Any]]:
     """历史任务列表（按创建时间倒序），带最近一次作业状态与最优费用。"""
     rows = _query(
         """SELECT t.task_code, t.task_name, t.status AS task_status, t.passenger_count,
-                  t.optimization_mode, t.direction, t.created_at, t.max_vehicles,
-                  t.budget_second, t.baseline_cost,
+                  t.optimization_mode, t.vehicle_mode, t.direction, t.created_at,
+                  t.max_vehicles, t.budget_second, t.baseline_cost,
                   j.status AS job_status, j.sub_status, j.gap, j.lower_bound,
                   j.best_cost, j.iteration, j.elapsed_seconds, j.stop_reason,
-                  s.total_cost, s.vehicle_count, s.saving_rate
+                  s.total_cost, s.vehicle_count, s.four_seat_count, s.six_seat_count,
+                  s.saving_rate
            FROM carpool_task t
            LEFT JOIN optimization_job j
                   ON j.id = (SELECT MAX(id) FROM optimization_job WHERE task_id = t.id)

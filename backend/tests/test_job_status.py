@@ -179,7 +179,9 @@ def main():
     # SEARCH_FAILED：解不可行，但没人「单人直达就超时」→ 只是没搜到
     ps6, dm6 = make(6, 9, scale=1.0)
     orig_feas = opt.solution_feasible
-    opt.solution_feasible = lambda vehicles: False   # 强制判不可行，验证分类逻辑
+    # 桩函数签名必须与真实 solution_feasible(vehicles, capacity=CAR_CAPACITY) 一致，
+    # 否则 optimize 内部按 (vehicles, cap) 调用会 TypeError（A2 引入 capacity 形参）
+    opt.solution_feasible = lambda vehicles, capacity=CAR_CAPACITY: False   # 强制判不可行，验证分类逻辑
     try:
         _, _, d6, _ = run(ps6, dm6, budget=1.0)
     finally:

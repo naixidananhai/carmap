@@ -27,7 +27,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import db
 from optimizer import (Passenger, DistanceMatrix, optimize,
                        allocate_cost, detour_warning, DETOUR_WARNING,
-                       MAX_ROUTE_SECONDS)
+                       MAX_ROUTE_SECONDS,
+                       VEHICLE_PREFS, VEHICLE_PREF_AUTO,
+                       normalize_vehicle_pref, capacity_limit,
+                       assign_vehicle_type, count_vehicle_types)
 from map_provider import create_provider
 
 app = FastAPI(title="拼车路线优化系统", version="1.2")
@@ -67,6 +70,14 @@ TASKS = {}
 VALID_MODES = ("cost", "fewest_vehicles")
 MODE_ALIASES = {"balanced": "cost"}
 
+# A2 车型偏好：直接复用 optimizer 的定义，避免两处枚举漂移
+VALID_VEHICLE_PREFS = VEHICLE_PREFS
+VEHICLE_PREF_TEXT = {
+    "auto": "自动（按实际人数配最小够用车型）",
+    "six": "仅 6 座",
+    "four": "仅 4 座",
+}
+
 
 def normalize_mode(mode: Optional[str]) -> str:
     m = (mode or "cost").strip().lower()
@@ -98,6 +109,9 @@ class TaskCreate(BaseModel):
     # 质量即饱和，n=45 时 4s→60s（13.7 倍迭代）只再省 4.3% 费用，默认取 10s 兼顾等待体验
     time_budget_s: int = 10
     max_vehicles: Optional[int] = None  # 车数上限硬约束（可选）
+    # A2 车型：auto=自动（6 座装填 + 按实际人数派车）/ six=仅 6 座 / four=仅 4 座。
+    # 两种车型计价相同，故该参数不改变费用，只决定容量上限与派车单上的型号。
+    vehicle_pref: str = VEHICLE_PREF_AUTO
     direction: str = "pickup"  # pickup=集合接人 / dropoff=散场送人
     # A8：「连续无改善」提前终止窗口（秒）。null=按预算自动（20%，3~60s）；
     #     0=关闭（跑满预算，实测多花约 50% 时间换约 1% 费用，见 v1.1/A7-A8 实现说明.md §5）
@@ -123,6 +137,7 @@ class PassengerDetailOut(BaseModel):
 
 class VehicleOut(BaseModel):
     vehicle_id: str
+    vehicle_type: int = 6  # A2：车型（4 / 6 座）。5~6 人必为 6 座，≤4 人按 vehicle_pref 派
     passenger_count: int
     order: List[str]  # 接人顺序（乘客名）
     coordinates: List[dict] = []  # 接人顺序的坐标 [{lat, lng, name}, ...]
@@ -147,6 +162,9 @@ class TaskResult(BaseModel):
     savings: float
     saving_rate: float
     vehicle_count: int
+    # A2：派车单车型统计。4 座车只可能出现在载客 ≤4 的车位上
+    four_seat_count: int = 0
+    six_seat_count: int = 0
     vehicles: List[VehicleOut]
     error: Optional[str] = None
     warning: Optional[str] = None  # 例如「车数上限未能满足」
@@ -299,6 +317,10 @@ def _job_payload(task: dict, result=None, error=None) -> dict:
         "eta_seconds": task.get("eta_seconds"),
         "elapsed_seconds": task.get("elapsed_seconds", 0),
         "provider": task.get("provider"),
+        # ---- A2：车型偏好（派车单口径）----
+        "vehicle_pref": task.get("vehicle_pref", VEHICLE_PREF_AUTO),
+        "vehicle_pref_text": VEHICLE_PREF_TEXT.get(
+            task.get("vehicle_pref", VEHICLE_PREF_AUTO), ""),
         # ---- 兼容字段：旧前端用 stage 画进度点、用 status 判终态 ----
         "status": LEGACY_STATUS.get(job_status, "RUNNING"),
         "stage": task.get("stage", "pending"),
@@ -356,11 +378,14 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
                      dest_lat: float, dest_lng: float,
                      mode: str, time_budget_s: int, direction: str = "pickup",
                      max_vehicles: Optional[int] = None,
-                     stable_stop_s: Optional[float] = None):
+                     stable_stop_s: Optional[float] = None,
+                     vehicle_pref: str = VEHICLE_PREF_AUTO):
     task = TASKS[task_id]
     rec = JobRecorder(task, task.get("job_id"))
     task["started_at"] = time.time()
     task["budget_s"] = time_budget_s
+    pref = normalize_vehicle_pref(vehicle_pref)
+    task["vehicle_pref"] = pref
     try:
         task["stage"] = "matrix"
         rec.status(db.JOB_INIT, task_status=db.TASK_MAPPING)
@@ -437,6 +462,7 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
             max_vehicles=max_vehicles, diag=diag,
             direct_pairs=direct_pairs,
             stable_s=(0.0 if stable_stop_s == 0 else stable_stop_s),
+            vehicle_pref=pref,
             job_cb=lambda ev: _on_job_event(rec, ev))
         job = diag.get("job") or {}
         warning = None
@@ -521,6 +547,7 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
 
             vehicles_out.append(VehicleOut(
                 vehicle_id=f"V{i+1:02d}",
+                vehicle_type=assign_vehicle_type(len(v.passengers), pref),
                 passenger_count=len(v.passengers),
                 order=[p.name for p in seq],
                 coordinates=coords,
@@ -563,6 +590,9 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
             savings=round(baseline - total_cost, 2),
             saving_rate=round((baseline - total_cost) / baseline * 100, 1) if baseline > 0 else 0,
             vehicle_count=len(best),
+            # A2：车型统计以 optimize 的派车结果为准（= 按各车实际载客数派车）
+            four_seat_count=job.get("four_seat_count", 0),
+            six_seat_count=job.get("six_seat_count", len(best)),
             vehicles=vehicles_out,
             warning=warning,
         )
@@ -572,7 +602,9 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
         # 落盘最终方案（solution / vehicle_route / route_passenger）
         db.save_solution(task.get("db_task_id"), task.get("job_id"), result.model_dump())
         print(f"[任务 {task_id}] 完成：{job.get('status')}，"
-              f"{len(best)} 辆车，{total_cost:.2f} 元，{job.get('stop_reason')}")
+              f"{len(best)} 辆车（4 座 {job.get('four_seat_count', 0)} / "
+              f"6 座 {job.get('six_seat_count', 0)}），"
+              f"{total_cost:.2f} 元，{job.get('stop_reason')}")
 
     except Exception as e:
         import traceback
@@ -655,9 +687,11 @@ def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
     task_id = str(uuid.uuid4())[:8]
     direction = req.direction if req.direction in ("pickup", "dropoff") else "pickup"
     mode = normalize_mode(req.mode)
+    pref = normalize_vehicle_pref(req.vehicle_pref)
 
     # A7：任务与名单先落库（CREATED）。这样即使进程在优化中途崩溃，
     # 提交内容仍可查，且 optimization_job 里能看出死在哪一个状态。
+    # A2：车型偏好落到 carpool_task.vehicle_mode（数据库设计里本就预留该列）
     db_task_id = db.save_task({
         "task_code": task_id,
         "task_name": req.task_name or (req.dest_address or "拼车任务"),
@@ -667,6 +701,7 @@ def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
         "destination_lng": req.dest_lng,
         "destination_lat": req.dest_lat,
         "optimization_mode": mode,
+        "vehicle_mode": pref,
         "direction": direction,
         "budget_second": req.time_budget_s,
         "max_vehicles": req.max_vehicles,
@@ -682,6 +717,8 @@ def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
         "result": None,
         "error": None,
         "stage": "pending",
+        "vehicle_pref": pref,
+        "capacity_limit": capacity_limit(pref),
         # A8 状态字段初始值
         "task_status": db.TASK_CREATED,
         "task_status_text": TASK_STATUS_TEXT[db.TASK_CREATED],
@@ -703,11 +740,12 @@ def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
     background_tasks.add_task(
         run_optimization, task_id, req.passengers,
         req.dest_lat, req.dest_lng, mode, req.time_budget_s, direction,
-        req.max_vehicles, req.stable_stop_s
+        req.max_vehicles, req.stable_stop_s, pref
     )
     # status=CREATED 为设计文档口径；PENDING 为旧客户端兼容字段
     return {"task_id": task_id, "status": "PENDING",
-            "task_status": db.TASK_CREATED, "job_status": db.JOB_INIT}
+            "task_status": db.TASK_CREATED, "job_status": db.JOB_INIT,
+            "vehicle_pref": pref}
 
 
 @app.get("/api/tasks", response_model=dict)
@@ -757,6 +795,10 @@ def get_task(task_id: str):
         "eta_seconds": 0,
         "elapsed_seconds": job.get("elapsed_seconds", 0),
         "provider": None,
+        # A2：车型偏好存在 carpool_task.vehicle_mode（数据库设计预留列）
+        "vehicle_pref": trow.get("vehicle_mode") or VEHICLE_PREF_AUTO,
+        "vehicle_pref_text": VEHICLE_PREF_TEXT.get(
+            trow.get("vehicle_mode") or VEHICLE_PREF_AUTO, ""),
         "status": LEGACY_STATUS.get(job_status, "RUNNING"),
         "stage": "done" if job_status in db.JOB_TERMINAL_OK else (
             "failed" if job_status == db.JOB_FAILED else "pending"),

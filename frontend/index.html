@@ -142,6 +142,15 @@
           <p style="font-size:11px; color:#c0c4cc; margin:4px 0 0;">「时间均衡」模式已下线（实测与「费用最优」结果无差异）</p>
         </div>
         <div style="margin-bottom:14px;">
+          <p class="field-label">车型</p>
+          <select class="text-input" id="vehicle_pref">
+            <option value="auto">自动选择（按实际人数配 4/6 座）</option>
+            <option value="four">仅 4 座</option>
+            <option value="six">仅 6 座</option>
+          </select>
+          <p style="font-size:11px; color:#c0c4cc; margin:4px 0 0;">4 座与 6 座计价相同；自动 = 按每辆车实际人数配最小够用车型（5~6 人必为 6 座）</p>
+        </div>
+        <div style="margin-bottom:14px;">
           <p class="field-label">车辆上限（可选）</p>
           <input class="text-input" id="max_vehicles" type="number" min="1" placeholder="不限">
           <p style="font-size:11px; color:#c0c4cc; margin:4px 0 0;">硬约束：车数不超过此值，再求最省费用</p>
@@ -635,6 +644,7 @@ async function submitTask() {
         dest_lat: destPoint.lat,
         dest_lng: destPoint.lng,
         mode: document.getElementById('opt_mode').value,
+        vehicle_pref: document.getElementById('vehicle_pref').value,
         time_budget_s: parseInt(document.getElementById('time_budget').value),
         max_vehicles: maxVehicles,
         direction: currentDirection
@@ -700,6 +710,24 @@ function solverNoteHTML(r) {
   const bits = ['求解状态 <b>' + jobStateLabel(r.job_status) + '</b>'];
   if (r.gap != null) bits.push('距理论下界 ' + (r.gap * 100).toFixed(0) + '%');
   return ' · ' + bits.join(' · ');
+}
+
+// A2 车型统计：4 座与 6 座计价相同，这里只如实展示派车单构成
+function vehicleTypeCounts(r) {
+  const vs = (r && r.vehicles) || [];
+  let four = r && r.four_seat_count;
+  let six = r && r.six_seat_count;
+  if (four == null) four = vs.filter(v => (v.vehicle_type || 6) === 4).length;
+  if (six == null) six = vs.filter(v => (v.vehicle_type || 6) === 6).length;
+  return { four: four || 0, six: six || 0 };
+}
+
+function vehicleTypeSummary(r) {
+  const c = vehicleTypeCounts(r);
+  const parts = [];
+  if (c.four) parts.push('4 座 ×' + c.four);
+  if (c.six) parts.push('6 座 ×' + c.six);
+  return parts.length ? '（' + parts.join(' · ') + '）' : '';
 }
 
 function renderJobStatus(d) {
@@ -816,7 +844,8 @@ function showResult(result) {
 
   const isDrop = result.direction === 'dropoff';
   const list = document.getElementById('vehicles_list');
-  list.innerHTML = '<p>共 <b>' + result.vehicle_count + '</b> 辆车 · 出发时间 <b>' +
+  list.innerHTML = '<p>共 <b>' + result.vehicle_count + '</b> 辆车' +
+      vehicleTypeSummary(result) + ' · 出发时间 <b>' +
       (document.getElementById('depart_time').value || '未设置') + '</b>' +
       solverNoteHTML(result) + '</p>';
   result.vehicles.forEach((v, idx) => {
@@ -827,7 +856,7 @@ function showResult(result) {
     list.innerHTML += `
       <div class="vehicle-item" style="border-left-color: ${color}">
         <div style="display: flex; justify-content: space-between;">
-          <b style="color: ${color}">${v.vehicle_id}（${v.passenger_count} 人）</b>
+          <b style="color: ${color}">${v.vehicle_id}（${v.passenger_count} 人 · ${v.vehicle_type || 6} 座）</b>
           <span style="font-size: 12px; color: #909399;">${v.distance_km} km · ${v.duration_min} 分钟 · ¥${v.cost}</span>
         </div>
         <div class="order-line">${orderLine}</div>
@@ -844,11 +873,13 @@ function resultText() {
   const isDrop = r.direction === 'dropoff';
   const depart = document.getElementById('depart_time').value || '未设置';
   let out = '拼车方案（' + (isDrop ? '散场' : '集合') + '）· ' + r.vehicle_count +
-            ' 辆车 · ' + r.vehicles.reduce((s, v) => s + v.passenger_count, 0) + ' 人\n';
+            ' 辆车' + vehicleTypeSummary(r) + ' · ' +
+            r.vehicles.reduce((s, v) => s + v.passenger_count, 0) + ' 人\n';
   out += '总费用 ¥' + r.total_cost + '（单独叫车 ¥' + r.baseline_cost + '，节省 ' +
          r.saving_rate + '%）\n';
   r.vehicles.forEach(v => {
-    out += '\n' + v.vehicle_id + '（' + v.passenger_count + ' 人）' + v.distance_km + 'km · ' +
+    out += '\n' + v.vehicle_id + '（' + v.passenger_count + ' 人 · ' +
+           (v.vehicle_type || 6) + ' 座）' + v.distance_km + 'km · ' +
            v.duration_min + '分钟 · ¥' + v.cost + '\n';
     const start = parseTime(depart);
     const legs = v.leg_durations || [];
@@ -895,7 +926,7 @@ function exportCSV() {
   const r = currentResult;
   if (!r) return;
   const isDrop = r.direction === 'dropoff';
-  const rows = [['车号', '路线顺序', '姓名', '地址', '预计时刻', '分摊元',
+  const rows = [['车号', '车型', '路线顺序', '姓名', '地址', '预计时刻', '分摊元',
                  '个人乘车分钟', '直达分钟', '较直达分钟', '绕行比例', '绕路预警',
                  '里程km', '时长分钟', '费用元']];
   const start = parseTime(document.getElementById('depart_time').value);
@@ -909,7 +940,8 @@ function exportCSV() {
     v.coordinates.forEach((c, i) => {
       const p = take(c.name);
       rows.push([
-        v.vehicle_id, i + 1, c.name, addrOf(c.name), fmtTime(t),
+        v.vehicle_id, (v.vehicle_type || 6) + '座', i + 1, c.name,
+        addrOf(c.name), fmtTime(t),
         p ? p.allocated_cost.toFixed(2) : '',
         p ? Math.round(p.ride_duration_s / 60) : '',
         p ? Math.round(p.direct_duration_s / 60) : '',
@@ -919,7 +951,8 @@ function exportCSV() {
       ]);
       if (i < v.coordinates.length - 1 && legs[i] != null) t += legs[i];
     });
-    rows.push([v.vehicle_id, '合计', '', '', '', v.cost, '', '', '', '', '',
+    rows.push([v.vehicle_id, (v.vehicle_type || 6) + '座', '合计', '', '', '', v.cost,
+               '', '', '', '', '',
                v.distance_km, v.duration_min, v.cost]);
   });
   const csv = '\uFEFF' + rows.map(row =>

@@ -368,9 +368,47 @@ def main():
               "求解状态" in (a8.get("note") or "") and "下界" in (a8.get("note") or ""),
               (a8.get("note") or "")[:90])
 
+        # A2：4/6 座车型——下拉可选、列表头有统计、每辆车标出座位数、导出文本同步
+        a2 = evaluate(send, """(() => {
+          const sel = document.getElementById('vehicle_pref');
+          const r = currentResult || {};
+          const vs = r.vehicles || [];
+          return {
+            options: sel ? Array.from(sel.options).map(o => o.value) : [],
+            head: (document.querySelector('#vehicles_list p') || {}).textContent || '',
+            titles: Array.from(document.querySelectorAll(
+                        '#vehicles_list .vehicle-item > div:first-child > b'))
+                        .map(b => b.textContent),
+            types: vs.map(v => v.vehicle_type),
+            four: r.four_seat_count, six: r.six_seat_count,
+            text: resultText()
+          };
+        })()""") or {}
+        check("车型下拉提供 自动 / 仅4座 / 仅6座 三项",
+              a2.get("options") == ["auto", "four", "six"], str(a2.get("options")))
+        check("结果列表头回显车型统计（4 座 ×n / 6 座 ×m）",
+              "座 ×" in (a2.get("head") or ""), (a2.get("head") or "")[:90])
+        check("每辆车标题标出座位数",
+              bool(a2.get("titles")) and all("座）" in t for t in a2.get("titles")),
+              str(a2.get("titles")))
+        check("车型取值只可能是 4 或 6，且统计自洽",
+              bool(a2.get("types"))
+              and set(a2.get("types")) <= {4, 6}
+              and (a2.get("four") or 0) + (a2.get("six") or 0) == len(a2.get("types")),
+              f'types={a2.get("types")} 4座={a2.get("four")} 6座={a2.get("six")}')
+        check("导出文本包含车型", "座）" in (a2.get("text") or ""))
+
         # A7：任务与结果已写穿 SQLite（前端不需刷新即可被别的客户端读到）
+        #
+        # 缺陷修复（2026-10-14）：原先这里取 `typeof TASK_ID !== 'undefined' ? TASK_ID : null`，
+        # 但前端**根本没有 TASK_ID 这个变量**（task_id 只存在于 submitTask 的局部作用域），
+        # 于是恒取到 null、整块断言被静默跳过——测试照报「全部通过」，实际一条都没跑。
+        # 现改为从页面已有的全局状态 currentResult.task_id 取（showResult 里赋值）。
         import urllib.request as _url
-        tid = evaluate(send, "typeof TASK_ID !== 'undefined' ? TASK_ID : null")
+        tid = evaluate(send,
+                       "(typeof currentResult !== 'undefined' && currentResult) "
+                       "? currentResult.task_id : null")
+        check("能从前端状态取到 task_id（SQLite 断言块不再被跳过）", bool(tid), str(tid))
         if tid:
             with _url.urlopen(f"http://localhost:8000/api/tasks/{tid}") as resp:
                 import json as _json
@@ -380,6 +418,18 @@ def main():
                                               "OPTIMAL", "FAILED")
                   and saved.get("terminal") is True,
                   f'{saved.get("job_status")} / terminal={saved.get("terminal")}')
+            # A2：车型偏好与车型统计都已落库并可读回
+            r0 = saved.get("result") or {}
+            check("接口回读车型偏好与车型统计",
+                  saved.get("vehicle_pref") in ("auto", "six", "four")
+                  and r0.get("four_seat_count") is not None
+                  and r0.get("six_seat_count") is not None,
+                  f'pref={saved.get("vehicle_pref")} 4座={r0.get("four_seat_count")} '
+                  f'6座={r0.get("six_seat_count")}')
+            check("每辆车都带合法车型（4 / 6）",
+                  bool(r0.get("vehicles"))
+                  and all(v.get("vehicle_type") in (4, 6) for v in r0.get("vehicles")),
+                  str([v.get("vehicle_type") for v in (r0.get("vehicles") or [])]))
 
         time.sleep(4)
         res = evaluate(send, """(() => {

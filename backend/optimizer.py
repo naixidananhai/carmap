@@ -7,9 +7,16 @@
 - 算法流程：DBSCAN 聚类 → 容量拆分 → 噪声点并入 → 贪心合并 → ALNS 优化 → 2-opt 接人顺序
 - 两种优化模式：cost（费用最优）/ fewest_vehicles（车数最少，两阶段求解）
   （V1.1 原设计的 balanced 加权和模式已于 P1 验证后删除：见 evaluate 注释）
-- 可选约束：max_vehicles（车数上限硬约束）
-- 费用函数：C(D) = 16 + 3 * max(D_km - 3, 0)
+- 可选约束：max_vehicles（车数上限硬约束）、vehicle_pref（A2 车型 4/6 座）
+- 费用函数：C(D) = 16 + 3 * max(D_km - 3, 0)   ← 不含车型项（两种车型同价）
 - 超时约束：单车路线 ≤ 5400 秒
+
+A2 车型（4 座 / 6 座）实现要点：
+- 车型是**可行性变量**不是成本变量：起步价与里程单价对 4/6 座完全相同；
+- 「优先 6 人」落在**分组**上（按 6 座装填 → 车数最少 → 起步价最省），
+  而非给 4 人的车贴 6 座标签；
+- 解定稿后按实际载客数派车：≤4 人 → 4 座，5~6 人 → 6 座（硬规则）；
+- 新增 destroy_over_time 定向拆车算子，专治「初始解自带超时车」。
 
 P1 验证结论（详见 v1.1/P1 ALNS 真实收益验证报告）：
 - ALNS 相对初始解降本约 48%，且对初始解质量不敏感（换种子终值差 <2%）
@@ -28,7 +35,28 @@ BASE_FEE = 16.0
 PER_KM_FEE = 3.0
 FREE_KM = 3.0
 MAX_ROUTE_SECONDS = 5400
-CAR_CAPACITY = 6  # 最大容量
+
+# ---- A2：车型（4 座 / 6 座混用）----
+# 车型**不参与费用函数**（见 calc_cost）：两种车型起步价与里程单价完全相同，
+# 因此「车型」是纯可行性变量——它只决定「一辆车最多能坐几人」。
+#   · 4 座：载客 ≤4 时够用
+#   · 6 座：载客 5~6 时唯一可行
+# 真正的成本杠杆是**车数**（每辆车 16 元起步价），所以分组一律先按 6 座装填
+# （=「优先 6 人」），只有 5400 秒硬约束逼着拆车时才会出现载客 ≤4 的车。
+CAR_CAPACITY_4 = 4
+CAR_CAPACITY_6 = 6
+CAR_CAPACITY = CAR_CAPACITY_6  # 最大容量（历史别名，等价于「不限车型时的上限」）
+
+# 车型偏好（对应前端「车型」三选一）：
+#   auto —— 自动：搜索按 6 座装填，最终按实际载客数配「最小够用」车型
+#           （≤4 人 → 4 座，5~6 人 → 6 座）。默认值。
+#   six  —— 仅 6 座：容量上限 6，且所有车一律标 6 座（适合车队只有 6 座车）
+#   four —— 仅 4 座：容量上限降到 4（适合车队只有 4 座车，会自动多派车）
+VEHICLE_PREF_AUTO = "auto"
+VEHICLE_PREF_SIX = "six"
+VEHICLE_PREF_FOUR = "four"
+VEHICLE_PREFS = (VEHICLE_PREF_AUTO, VEHICLE_PREF_SIX, VEHICLE_PREF_FOUR)
+
 AVG_SPEED_KMH = 30.0  # Haversine 回退时用
 
 # 绕路预警阈值（业务需求 §第五节）：满足任一即标注「明显绕路」
@@ -52,6 +80,68 @@ class Vehicle:
     distance_m: float = 0.0
     duration_s: int = 0
     cost: float = 0.0
+
+
+# ============ A2 车型（4 座 / 6 座）============
+# 设计要点：车型**不是搜索状态**，而是解的导出属性。
+#   · 搜索期只关心「容量上限 capacity_limit(pref)」，保证任何车都不超载；
+#   · 解定稿后再由 assign_vehicle_type 按每辆车实际载客数派车型。
+# 这样 ALNS 的搜索空间与 A2 之前完全一致（同一批可行解），
+# 区别只在「输出给调度的是几座车」，避免把纯标签问题变成搜索问题。
+
+def normalize_vehicle_pref(pref: Optional[str]) -> str:
+    """把外部传入的车型偏好归一到 auto / six / four。未知值回退 auto。"""
+    p = (pref or VEHICLE_PREF_AUTO).strip().lower()
+    if p in VEHICLE_PREFS:
+        return p
+    print(f"  [车型] {pref!r} 未知，回退默认 {VEHICLE_PREF_AUTO!r}")
+    return VEHICLE_PREF_AUTO
+
+
+def capacity_limit(pref: str = VEHICLE_PREF_AUTO) -> int:
+    """
+    该车型偏好下车容量上限（分组与可行性判定用）：
+
+    - auto / six → 6：先按 6 座装填（「优先 6 人」，车数最少 = 起步价最省）；
+    - four      → 4：车队只有 4 座车，装载上限直接降到 4（会自动多派车）。
+    """
+    return CAR_CAPACITY_4 if pref == VEHICLE_PREF_FOUR else CAR_CAPACITY_6
+
+
+def assign_vehicle_type(passenger_count: int, pref: str = VEHICLE_PREF_AUTO) -> int:
+    """
+    给「实际载客 passenger_count 人」的一辆车派车型（4 或 6）。
+
+    硬规则（《技术方案 V1.1》第二步「容量拆分」）：
+      · 5~6 人 → 只能 6 座（4 座装不下）；
+      · 1~4 人 → 4 / 6 座都合法，具体看车型偏好。
+
+    两种车型计费完全相同，故「派哪档」不改变费用，只影响可执行的派车单：
+      · auto：按「最小够用」派车 —— ≤4 人给 4 座（不占 6 座资源），5~6 人给 6 座；
+      · six ：一律 6 座（车队只有 6 座车时使用）；
+      · four：只会出现 4 座（容量上限已被 capacity_limit 压到 4）。
+
+    注：「优先 6 人」的实质在**分组**（按 6 装填以减少车数），而非给 4 人的车
+    贴 6 座标签——《算法详细设计 V1.1》§2 亦明确「4 人车型或 6 人车型成本完全
+    一样，随便选」。故 auto 下取信息量更大的「最小够用」派车口径。
+    """
+    if passenger_count > CAR_CAPACITY_4:      # 5~6 人
+        return CAR_CAPACITY_6
+    if passenger_count <= 0:
+        return CAR_CAPACITY_6
+    return CAR_CAPACITY_6 if pref == VEHICLE_PREF_SIX else CAR_CAPACITY_4
+
+
+def annotate_vehicle_types(vehicles: List[Vehicle],
+                           pref: str = VEHICLE_PREF_AUTO) -> List[int]:
+    """解定稿后，按每辆车实际载客数批量派车型。返回与 vehicles 同序的车型列表。"""
+    return [assign_vehicle_type(len(v.passengers), pref) for v in vehicles]
+
+
+def count_vehicle_types(types: List[int]) -> Tuple[int, int]:
+    """统计 (4 座数量, 6 座数量)。"""
+    four = sum(1 for t in types if t == CAR_CAPACITY_4)
+    return four, len(types) - four
 
 
 # ============ 距离计算 ============
@@ -209,10 +299,14 @@ def two_opt(dm: DistanceMatrix, passenger_indices: List[int], dest_idx: int):
 
 
 # ============ 构建初始解 ============
-def build_initial_solution(passengers: List[Passenger], dest: Passenger, dm: DistanceMatrix):
+def build_initial_solution(passengers: List[Passenger], dest: Passenger, dm: DistanceMatrix,
+                           capacity: int = CAR_CAPACITY):
     """
     返回 List[Vehicle]
     流程：DBSCAN → 容量拆分 → 噪声点并入 → 2-opt 每车顺序
+
+    capacity（A2）：分组上限。auto/six → 6（「优先 6 人」：14 人 → 6+6+2 而不是
+    4+4+4+2，少一辆车就少 16 元起步价）；four → 4（车队只有 4 座车）。
 
     噪声点处理（P1 修复）：原实现把每个噪声点单独开一车，在 eps=2km / 乘客抖动
     ±2.2km 的条件下平均产生 16.5 车 / 28.5 人（合理值约 5 车）。现改为把噪声点按
@@ -233,12 +327,12 @@ def build_initial_solution(passengers: List[Passenger], dest: Passenger, dm: Dis
         else:
             clusters.setdefault(labels[i], []).append(i)
 
-    # 容量拆分
+    # 容量拆分：按 6（或 4）座切分，先装满再开下一辆
     vehicle_indices = []
     for member_indices in clusters.values():
         remaining = list(member_indices)
         while remaining:
-            group = remaining[:CAR_CAPACITY] if len(remaining) > CAR_CAPACITY else remaining
+            group = remaining[:capacity] if len(remaining) > capacity else remaining
             vehicle_indices.append(group)
             remaining = remaining[len(group):]
 
@@ -248,7 +342,7 @@ def build_initial_solution(passengers: List[Passenger], dest: Passenger, dm: Dis
     for i in noise:
         best_gi, best_delta, best_order = -1, float('inf'), None
         for gi, g in enumerate(vehicle_indices):
-            if len(g) >= CAR_CAPACITY:
+            if len(g) >= capacity:
                 continue
             order = two_opt(dm, g + [i], dest_idx)
             delta = dm.route_distance(order, dest_idx)[0] - group_d[gi]
@@ -283,14 +377,14 @@ def build_initial_solution(passengers: List[Passenger], dest: Passenger, dm: Dis
 INFEASIBLE_PENALTY = 1e6
 
 
-def vehicle_feasible(v: Vehicle) -> bool:
-    """单车硬约束：座位数 ≤ 6，单车行程 ≤ 5400 秒。"""
-    return v.duration_s <= MAX_ROUTE_SECONDS and len(v.passengers) <= CAR_CAPACITY
+def vehicle_feasible(v: Vehicle, capacity: int = CAR_CAPACITY) -> bool:
+    """单车硬约束：载客数 ≤ 车型容量上限（A2：auto/six=6，four=4），行程 ≤ 5400 秒。"""
+    return v.duration_s <= MAX_ROUTE_SECONDS and len(v.passengers) <= capacity
 
 
-def solution_feasible(vehicles: List[Vehicle]) -> bool:
+def solution_feasible(vehicles: List[Vehicle], capacity: int = CAR_CAPACITY) -> bool:
     """整解可行性：每辆车都满足硬约束，且没有空车。"""
-    return bool(vehicles) and all(vehicle_feasible(v) for v in vehicles)
+    return bool(vehicles) and all(vehicle_feasible(v, capacity) for v in vehicles)
 
 
 def lower_bound_cost(direct_m: List[float], capacity: int = CAR_CAPACITY) -> float:
@@ -327,6 +421,10 @@ def lower_bound_cost(direct_m: List[float], capacity: int = CAR_CAPACITY) -> flo
     这两个约束只会让真实最优更贵，故对下界无影响（下界仍有效）。
     代价是**偏松**：实测本项目 15 人实例 gap ≈ 55%~65%，因此 STOP_GAP
     在正常规模下不会触发（详见 v1.1/A7-A8 实现说明.md §4）。
+
+    capacity（A2）：必须传**实际生效的容量上限**（capacity_limit(pref)）——
+    推导每一步都用「车内最多 capacity 人」，容量变小推导依然成立且界更紧。
+    four 模式（上限 4）下 k_min 更大、下界更紧，gap 会相应收窄。
     """
     n = len(direct_m)
     if n <= 0:
@@ -351,12 +449,13 @@ def gap_ratio(best_cost: float, lb: Optional[float]) -> Optional[float]:
 
 
 def evaluate(vehicles: List[Vehicle], baseline_cost: float, n_passengers: int,
-             mode="cost", max_vehicles=None):
+             mode="cost", max_vehicles=None, capacity: int = CAR_CAPACITY):
     """
     cost            : (总费用, 总时长, 车数)
     fewest_vehicles : (车数, 总费用, 总时长)
     max_vehicles    : 车数上限硬约束；超出一辆就在首元素上加一个罚分。
     单车时长        : 超过 MAX_ROUTE_SECONDS 的车按辆数计罚分（与上限同理）。
+    单车容量        : 载客超 capacity 的车按辆数计罚分（A2；与时长同理）。
 
     关于 V1.1 的 balanced（加权和）模式已被删除：P1 实测其权重 0.5/0.3/0.2 因
     time_norm / vehicle_norm 分母极大，使 cost 项占最终 score 约 76%，产出与 cost
@@ -367,6 +466,9 @@ def evaluate(vehicles: List[Vehicle], baseline_cost: float, n_passengers: int,
     初始解（DBSCAN + 2-opt，不过时长）与最终结果都不检查，导致**超时路线被当作
     成功方案返回**（实测散场模式出现 5984 秒 > 5400 秒上限仍报成功）。
     现在把违例计入排序分，搜索才有动力把超时路线拆掉。
+
+    关于容量罚分（A2）：搜索期构造路径（_best_insertion / 分组）已保证不超载，
+    此处只是与时长同源的兜底——一旦任何算子将来漏检，排序分立刻能感知到。
     """
     total_cost = sum(v.cost for v in vehicles)
     total_duration = sum(v.duration_s for v in vehicles)
@@ -375,7 +477,8 @@ def evaluate(vehicles: List[Vehicle], baseline_cost: float, n_passengers: int,
     if max_vehicles is not None and vehicle_count > max_vehicles:
         over = vehicle_count - max_vehicles
     over_dur = sum(1 for v in vehicles if v.duration_s > MAX_ROUTE_SECONDS)
-    pen = (over + over_dur) * INFEASIBLE_PENALTY
+    over_cap = sum(1 for v in vehicles if len(v.passengers) > capacity)
+    pen = (over + over_dur + over_cap) * INFEASIBLE_PENALTY
 
     if mode == "fewest_vehicles":
         return (vehicle_count + pen, total_cost, total_duration)
@@ -391,7 +494,8 @@ class ALNS:
                  mode="cost", time_budget_s=300, trace=False,
                  T0=None, T_end_ratio=0.35, max_vehicles=None, cooling="time",
                  alpha=None, two_phase=None, phase1_ratio=0.4,
-                 cost_lb=None, gap_stop_pct=None, stable_s=None):
+                 cost_lb=None, gap_stop_pct=None, stable_s=None,
+                 capacity_limit: int = CAR_CAPACITY):
         """
         T0           : 退火初温；None 时按模式显式推定（见 _default_T0）
         T_end_ratio  : 按时间降温时，预算末的 T / T0。0.35 取自 P1 实测——当前调度在
@@ -405,6 +509,8 @@ class ALNS:
         gap_stop_pct : gap 提前终止阈值，小数（0.05 = 5%）。None 表示不启用
         stable_s     : 「连续无改善」提前终止的窗口（秒）。None 表示不启用。
                        只作用于**最后一个阶段**，避免两阶段搜索的第 1 阶段被提前打断
+        capacity_limit: 单车载客上限（A2）。auto/six → 6，four → 4。
+                       只影响可行性判定，不影响费用（车型不参与费用函数）
         """
         self.trace = [] if trace else None  # 诊断用：记录收敛轨迹，默认关闭不影响行为
         self.vehicles = vehicles
@@ -417,6 +523,7 @@ class ALNS:
         self.time_budget = time_budget_s
         self.dest_idx = len(passengers)
         self.max_vehicles = max_vehicles
+        self.capacity_limit = capacity_limit   # A2：单车载客上限（4 或 6）
         self.cooling = cooling
         self.alpha = 0.9995 if alpha is None else alpha
         self.T_end_ratio = T_end_ratio
@@ -433,7 +540,8 @@ class ALNS:
 
         # 初始解
         self.best = [self._copy_vehicle(v) for v in vehicles]
-        self.best_score = evaluate(self.best, baseline_cost, n_passengers, mode, max_vehicles)
+        self.best_score = evaluate(self.best, baseline_cost, n_passengers, mode, max_vehicles,
+                                   capacity_limit)
         self.current = [self._copy_vehicle(v) for v in vehicles]
         self.current_score = self.best_score
         self.stats = {}
@@ -494,7 +602,7 @@ class ALNS:
         return -1
 
     def _is_feasible(self, v: Vehicle):
-        return vehicle_feasible(v)
+        return vehicle_feasible(v, self.capacity_limit)
 
     def _rebuild_vehicle(self, passenger_list: List[Passenger]):
         """给定乘客列表，2-opt 优化顺序并算费用"""
@@ -545,6 +653,39 @@ class ALNS:
         self.current.remove(v)
         return removed
 
+    def destroy_over_time(self, k=2):
+        """
+        A2 定向拆车：抽出**超时最严重**那辆车里最拖时间的 k 位乘客。
+
+        为什么需要它：5400 秒是硬约束，而 destroy_random / destroy_worst /
+        destroy_route 都是「无目标」的——它们不知道哪辆车正卡在超时上。当初始解
+        本身就带一辆超时车（散场模式常见，实测出现过 5984s > 5400s），
+        靠随机算子把它拆开纯属碰运气。本算子直接对超时车下手，命中率高得多。
+
+        注意：只在 `_run_phase` 检测到确有超时车时才会被选中，因此
+        **可行实例的搜索轨迹与 A2 之前逐位一致**（P1 的实测结论不受影响）。
+
+        选人依据：逐位试抽「谁离队能让这辆车掉最多时长」，取 drop 最大的 k 位。
+        计算量 O(len(v)) 次重建，且仅作用于一辆车。
+        """
+        over = [v for v in self.current if v.duration_s > MAX_ROUTE_SECONDS]
+        if not over:
+            return []
+        v = max(over, key=lambda x: x.duration_s)
+        if len(v.passengers) <= 1:
+            # 单车单人仍超时：拆不出来（此人直达本身就超上限），交给别的算子/判定
+            return []
+        scored = []
+        for p in v.passengers:
+            rest = [q for q in v.passengers if q.id != p.id]
+            nv = self._rebuild_vehicle(rest)
+            drop = v.duration_s - (nv.duration_s if nv else 0)
+            scored.append((drop, p))
+        scored.sort(key=lambda x: -x[0])
+        removed = [p for _, p in scored[:max(1, k)]]
+        self._remove_passengers(removed)
+        return removed
+
     def repair_greedy(self, removed: List[Passenger]):
         """贪心插入：每个被移除的乘客找费用增加最少的位置；无处可插则单点成车"""
         for p in removed:
@@ -582,7 +723,7 @@ class ALNS:
         best_v = best_new = None
         best_inc = float('inf')
         for v in self.current:
-            if len(v.passengers) >= CAR_CAPACITY:
+            if len(v.passengers) >= self.capacity_limit:
                 continue
             nv = self._rebuild_vehicle(v.passengers + [p])
             if nv and self._is_feasible(nv):
@@ -642,12 +783,20 @@ class ALNS:
             else:
                 T = max(T * self.alpha, 1e-9)
 
-            # 选择 Destroy
-            destroy_type = random.choice(["random", "worst", "route"])
+            # 选择 Destroy。
+            # A2：仅当**确有超时车**时才把 destroy_over_time 放进轮盘——两个分支
+            # 的 random.choice 消耗同样一次随机数，故可行实例的随机轨迹与 A2 之前
+            # 逐位一致（不破坏 P1 验证过的行为）；一旦出现超时车，拆车算子即刻生效。
+            if any(v.duration_s > MAX_ROUTE_SECONDS for v in self.current):
+                destroy_type = random.choice(["random", "worst", "route", "over_time"])
+            else:
+                destroy_type = random.choice(["random", "worst", "route"])
             if destroy_type == "random":
                 removed = self.destroy_random(k=random.randint(1, 4))
             elif destroy_type == "worst":
                 removed = self.destroy_worst(k=random.randint(1, 3))
+            elif destroy_type == "over_time":
+                removed = self.destroy_over_time(k=random.randint(1, 2))
             else:
                 removed = self.destroy_route()
 
@@ -660,7 +809,7 @@ class ALNS:
             # 评价：score 用于 best 追踪（字典序，含硬约束罚分），
             # energy 用于退火接受门（只看主目标，不含罚分——见 _energy 注释）
             score = evaluate(self.current, self.baseline_cost, self.n_passengers,
-                             mode, max_vehicles)
+                             mode, max_vehicles, self.capacity_limit)
             energy_now = self._energy(self.current, mode)
 
             # 模拟退火接受（δ 相对当前最优，按能量比较）
@@ -720,7 +869,7 @@ class ALNS:
             # (车数, 费用, 时长)，但受搜索轨迹影响，在车数相同时费用平均高 10.59%。
             self.current = [self._copy_vehicle(v) for v in self.best]
             self.best_score = evaluate(self.best, self.baseline_cost, self.n_passengers,
-                                       "cost", n_veh)
+                                       "cost", n_veh, self.capacity_limit)
             self.current_score = self.best_score
             ph2 = self._run_phase(self.time_budget - p1_budget, "cost", n_veh,
                                   p1_budget, progress_callback, "cost_under_cap",
@@ -795,13 +944,16 @@ def optimize(passengers: List[Passenger], dest: Passenger,
              dm: DistanceMatrix, mode="cost", time_budget_s=300, stage_cb=None,
              diag: Optional[dict] = None, max_vehicles: Optional[int] = None,
              job_cb=None, progress_cb=None, direct_pairs=None,
-             gap_stop_pct=None, stable_s=None):
+             gap_stop_pct=None, stable_s=None, vehicle_pref=VEHICLE_PREF_AUTO):
     """
     主入口：给定乘客列表 + 终点 + 距离矩阵，返回 (最优车辆列表, 基线费用)
 
     stage_cb     : 可选回调，阶段变化时通知（"initial" / "alns"）——旧前端进度条用
     diag         : 可选诊断字典，传入后填入 initial_score/stats/trace/job
     max_vehicles : 车数上限硬约束（None 表示不限）
+    vehicle_pref : A2 车型偏好（auto / six / four）。auto=按 6 座装填、按实际载客数
+                   派「最小够用」车型；six=一律 6 座；four=容量上限降到 4。
+                   车型不参与费用，只影响容量上限与输出的派车型号。
     job_cb       : A8 作业状态回调，收到 {'kind': ...} 形式的事件字典：
                      {'kind':'init'}                                    → INIT
                      {'kind':'feasible', 'vehicles':n, 'cost':x}        → FEASIBLE
@@ -820,16 +972,19 @@ def optimize(passengers: List[Passenger], dest: Passenger,
     stable_s     : 「连续无改善」窗口（秒）；None = 按预算自动缩放（stable_window）；
                    传正无穷可关闭（对照实验用）
 
-    返回：(best, baseline_cost)。可行性判定与终止原因写入 diag["job"]。
+    返回：(best, baseline_cost)。可行性判定与终止原因写入 diag["job"]，
+    其中 job["vehicle_types"] / four_seat_count / six_seat_count 为 A2 派车结果。
     """
     n_p = len(passengers)
+    pref = normalize_vehicle_pref(vehicle_pref)
+    cap = capacity_limit(pref)
     _gap_pct = GAP_STOP_PCT if gap_stop_pct is None else gap_stop_pct
     if _gap_pct is not None and _gap_pct < 0:
         _gap_pct = None
     _stable = stable_window(time_budget_s) if stable_s is None else stable_s
-    # 容量下限：每车最多 CAR_CAPACITY 人，低于此值的上限不可能满足，直接上调并提示
+    # 容量下限：每车最多 cap 人，低于此值的上限不可能满足，直接上调并提示
     if max_vehicles is not None:
-        capacity_min = -(-n_p // CAR_CAPACITY) if n_p else 0
+        capacity_min = -(-n_p // cap) if n_p else 0
         if max_vehicles < capacity_min:
             print(f"  [约束] max_vehicles={max_vehicles} 低于容量下限 {capacity_min}，已上调")
             if diag is not None:
@@ -844,18 +999,19 @@ def optimize(passengers: List[Passenger], dest: Passenger,
     direct_m = [float(d or 0.0) for d, _ in direct_pairs]
     direct_s = [float(s or 0.0) for _, s in direct_pairs]
 
-    # 费用下界（A8：gap 的分母）。仅 cost 目标有意义，fewest_vehicles 只做记录
-    lb = lower_bound_cost(direct_m)
+    # 费用下界（A8：gap 的分母）。仅 cost 目标有意义，fewest_vehicles 只做记录。
+    # A2：必须用实际生效的容量上限（four 模式上限 4，下界更紧）
+    lb = lower_bound_cost(direct_m, cap)
     if job_cb:
         job_cb({"kind": "init"})
 
     # 初始解
-    print("  构建初始解...")
+    print(f"  构建初始解...（车型 {pref}，容量上限 {cap} 人）")
     if stage_cb:
         stage_cb("initial")
-    vehicles = build_initial_solution(passengers, dest, dm)
+    vehicles = build_initial_solution(passengers, dest, dm, capacity=cap)
     print(f"  初始解: {len(vehicles)} 辆车")
-    initial_feasible = solution_feasible(vehicles)
+    initial_feasible = solution_feasible(vehicles, cap)
     if job_cb:
         job_cb({"kind": "feasible", "vehicles": len(vehicles),
                 "cost": round(sum(v.cost for v in vehicles), 2),
@@ -863,7 +1019,7 @@ def optimize(passengers: List[Passenger], dest: Passenger,
 
     if diag is not None:
         diag["initial_score"] = evaluate(vehicles, baseline_cost, len(passengers), mode,
-                                         max_vehicles)
+                                         max_vehicles, cap)
         diag["initial_vehicles"] = len(vehicles)
         diag["baseline_cost"] = baseline_cost
         diag["lower_bound"] = lb
@@ -891,7 +1047,7 @@ def optimize(passengers: List[Passenger], dest: Passenger,
     alns = ALNS(vehicles, passengers, dest, dm, baseline_cost, len(passengers), mode,
                 time_budget_s, trace=(diag is not None), max_vehicles=max_vehicles,
                 cost_lb=lb, gap_stop_pct=(_gap_pct if mode == "cost" else None),
-                stable_s=_stable)
+                stable_s=_stable, capacity_limit=cap)
     best = alns.run(progress_callback=_on_progress)
 
     stop = dict(alns.stop or {})
@@ -905,7 +1061,11 @@ def optimize(passengers: List[Passenger], dest: Passenger,
         reason = "OPTIMAL"
     stop["reason"] = reason
 
-    final_ok = solution_feasible(best)
+    final_ok = solution_feasible(best, cap)
+    # A2：解定稿后按每辆车实际载客数派车型（4 座 / 6 座）。费用与车型无关，
+    # 故这一步不改变任何搜索结论，只产出可直接执行的派车单。
+    vtypes = annotate_vehicle_types(best, pref)
+    four_cnt, six_cnt = count_vehicle_types(vtypes)
     job = {
         "status": reason if final_ok else "FAILED",
         "sub_status": None if final_ok else (
@@ -918,13 +1078,19 @@ def optimize(passengers: List[Passenger], dest: Passenger,
         "elapsed": float(alns.stats.get("elapsed", 0.0)),
         "feasible": final_ok,
         "initial_feasible": initial_feasible,
+        "vehicle_pref": pref,
+        "capacity_limit": cap,
+        "vehicle_types": vtypes,
+        "four_seat_count": four_cnt,
+        "six_seat_count": six_cnt,
     }
     job["stop_reason"] = stop_reason_text(job["status"], stop, job["gap"])
 
     if diag is not None:
         diag["stats"] = getattr(alns, "stats", {})
         diag["trace"] = alns.trace or []
-        diag["final_score"] = evaluate(best, baseline_cost, len(passengers), mode, max_vehicles)
+        diag["final_score"] = evaluate(best, baseline_cost, len(passengers), mode,
+                                       max_vehicles, cap)
         diag["job"] = job
         if not final_ok:
             worst = max((v.duration_s for v in best), default=0)
