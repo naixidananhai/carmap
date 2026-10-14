@@ -33,7 +33,16 @@ DIRECTION_PATH = "/v3/direction/driving"  # 驾车路径规划（含加密折线
 GEOCODE_PATH = "/v3/geocode/geo"          # 地理编码
 
 MAX_ORIGINS = 100  # 高德 origins 单次上限
-DEFAULT_QPS_DELAY = 0.05  # 节流间隔，高德个人认证 QPS 较低
+# 个人认证 Key 的 QPS 上限较低（实测约 3~5 次/秒），这里保守取 0.35s/次 ≈ 2.8 QPS，
+# 否则会频繁触发 CUQPS_HAS_EXCEEDED_THE_LIMIT 导致矩阵大面积空洞
+DEFAULT_QPS_DELAY = 0.35
+
+# 触发限流时的退避序列（秒）
+_BACKOFF = (0.6, 1.2, 2.0)
+# 需识别为「限流/配额」并退避重试的错误码
+_THROTTLE_CODES = ("CUQPS_HAS_EXCEEDED_THE_LIMIT", "CUQPS_OVER_LIMIT",
+                   "DAILY_QUERY_OVER_LIMIT", "QPS_HAS_EXCEEDED_THE_LIMIT",
+                   "QUOTA", "FLOW", "RATE_LIMIT")
 
 
 # ============================================================
@@ -56,29 +65,65 @@ def gcj02_to_bd09(lng: float, lat: float) -> Tuple[float, float]:
 
 
 # ============================================================
-# 高德加密 polyline 解码
+# 高德 polyline 解析
 # ============================================================
 def decode_amap_polyline(polyline: str) -> List[Tuple[float, float]]:
     """
-    解码高德 direction 接口返回的加密 polyline。
+    解析高德 direction 接口返回的 polyline，返回 [(lng, lat), ...]（GCJ-02）。
 
-    算法（与 Google encoded polyline 同源，高德在其基础上叠加了偏移）：
-      1. 每个字符 ASCII - 63 得到 5 位有效载荷 + 1 位符号位
-      2. 符号位 1 表示负数，先取反再加 1（补码）
-      3. 经纬度交替累加，缩放系数 1e-5
+    实测结论（2026-10，以真实响应为准，不要凭记忆改）：
+    Web 服务 /v3/direction/driving 在 extensions=base 下返回的 polyline 是
+    **明文绝对坐标**，格式为 "lng,lat;lng,lat;..."，坐标已是 GCJ-02 绝对值，
+    每个 step 的 polyline 都自带绝对坐标，无需累加基准。
 
-    返回 [(lng, lat), ...]，顺序与输入一致。
+    注意：不同版本/不同客户端（JS SDK vs Web服务）曾出现过加密格式
+    （Google encoded polyline 变体，缩放 1e5）。为兼容，这里保留
+    _decode_encoded_polyline 作为兜底：按"明文"解析失败时自动尝试。
+
+    返回顺序与输入一致。
+    """
+    if not polyline:
+        return []
+
+    text = polyline.strip()
+    # 明文判定：含 ";" 分隔且形如 "数字,数字"
+    if ";" in text or ("," in text and "?" not in text and "A" not in text[:5]):
+        pts: List[Tuple[float, float]] = []
+        ok = True
+        for seg in text.split(";"):
+            seg = seg.strip()
+            if not seg:
+                continue
+            parts = seg.split(",")
+            if len(parts) < 2:
+                ok = False
+                break
+            try:
+                pts.append((float(parts[0]), float(parts[1])))
+            except ValueError:
+                ok = False
+                break
+        # 明文坐标量级校验：经度应在 [-180,180]、纬度在 [-90,90]
+        if ok and pts and all(-180 <= x <= 180 and -90 <= y <= 90 for x, y in pts):
+            return pts
+
+    return _decode_encoded_polyline(text)
+
+
+def _decode_encoded_polyline(polyline: str) -> List[Tuple[float, float]]:
+    """
+    加密 polyline 解码（Google encoded polyline 变体，缩放 1e5）。
+    作为兼容兜底保留——实测 Web 服务返回明文，此路径一般不会触发。
     """
     result = []
     index = 0
     length = len(polyline)
     lat = 0.0
     lng = 0.0
-    # 高德在解码前会给经纬度一个统一的起始偏移
-    _OFFSET = 1e5
+    offset = 1e5
 
     while index < length:
-        for _ in range(2):  # 每轮解出经度、纬度各一个
+        for which in (0, 1):  # 每轮解出经度、纬度各一个
             shift = 0
             result_byte = 0
             while True:
@@ -90,13 +135,13 @@ def decode_amap_polyline(polyline: str) -> List[Tuple[float, float]]:
                 shift += 5
                 if b < 0x20:
                     break
-            # 符号位处理：奇数表示负数
+            # 符号位处理：奇数表示负数（补码）
             delta = ~(result_byte >> 1) if (result_byte & 1) else (result_byte >> 1)
-            if _ == 0:
+            if which == 0:
                 lng += delta
             else:
                 lat += delta
-        result.append((lng / _OFFSET / 10.0, lat / _OFFSET / 10.0))
+        result.append((lng / offset, lat / offset))
     return result
 
 
@@ -111,12 +156,20 @@ class AmapClient:
     仅在调用高德接口前转 GCJ-02，返回折线前转回 BD09。
     """
 
-    def __init__(self, key: Optional[str] = None, qps_delay: float = DEFAULT_QPS_DELAY):
+    def __init__(self, key: Optional[str] = None, qps_delay: Optional[float] = None):
         self.key = key or config.os.environ.get("AMAP_KEY", "")
+        # 节流间隔可用 AMAP_QPS_DELAY 覆盖（默认 0.35s ≈ 2.8 QPS）
+        try:
+            env_delay = float(config.os.environ.get("AMAP_QPS_DELAY", ""))
+            if env_delay > 0:
+                qps_delay = env_delay
+        except ValueError:
+            pass
+        self.qps_delay = DEFAULT_QPS_DELAY if qps_delay is None else qps_delay
         self.session = requests.Session()
         self.cache = {}
         self._last_call_ts = 0.0
-        self._qps_delay = qps_delay
+        self._qps_delay = self.qps_delay
 
     # ---------- 基础设施 ----------
     def _throttle(self):
@@ -128,11 +181,14 @@ class AmapClient:
             time.sleep(self._qps_delay - elapsed)
         self._last_call_ts = time.time()
 
-    def _request(self, path: str, params: dict, retries: int = 2) -> Optional[dict]:
+    def _request(self, path: str, params: dict, retries: int = 3) -> Optional[dict]:
         """
         发起 GET 请求。
         高德鉴权：params["key"] = KEY；若 key 设置了 sig（数字签名），
         还需 sig 参数——本项目用普通 key + IP 白名单，不启用 sig。
+
+        对限流类错误（CUQPS_HAS_EXCEEDED_THE_LIMIT 等）做指数退避重试；
+        若最终仍失败返回 None，由调用方决定如何处理空洞。
         """
         if not self.key:
             raise RuntimeError(
@@ -144,19 +200,24 @@ class AmapClient:
         params.setdefault("output", "json")
         url = HOST + path
 
+        last_info = ""
         for attempt in range(retries):
             self._throttle()
             try:
-                resp = self.session.get(url, params=params, timeout=5)
+                resp = self.session.get(url, params=params, timeout=8)
                 data = resp.json()
                 if str(data.get("status")) == "1":
                     return data
-                info = data.get("info", "")
-                print(f"  [高德API] {path} status={data.get('status')} {info}")
-                # 配额/频率类错误退避后重试；参数错误直接返回
-                if "QUOTA" in str(info).upper() or "FLOW" in str(info).upper() or "忙" in str(info):
-                    time.sleep(0.5 * (attempt + 1))
+                info = str(data.get("info", ""))
+                last_info = info
+                # 限流/配额类错误：退避后重试（个人认证 Key 很容易触发 QPS 上限）
+                if any(code in info.upper() for code in _THROTTLE_CODES):
+                    wait = _BACKOFF[min(attempt, len(_BACKOFF) - 1)]
+                    print(f"  [高德限流] {info}，{wait:.1f}s 后重试 "
+                          f"({attempt + 1}/{retries - 1})")
+                    time.sleep(wait)
                     continue
+                print(f"  [高德API] {path} status={data.get('status')} {info}")
                 return None
             except Exception as e:
                 print(f"  [高德API异常] {path}: {e}")
@@ -164,6 +225,8 @@ class AmapClient:
                     time.sleep(0.3)
                     continue
                 return None
+        if last_info:
+            print(f"  [高德API放弃] {path}: {last_info}（已重试 {retries} 次）")
         return None
 
     # ---------- 地理编码 ----------
@@ -221,13 +284,19 @@ class AmapClient:
         distance_m = float(p0.get("distance", 0) or 0)
         duration_s = float(p0.get("duration", 0) or 0)
 
-        # 拼接加密折线 → 解码 → GCJ-02 转回 BD09
+        # 拼接各 step 的折线 → GCJ-02 转回 BD09
+        # 注意：相邻 step 的边界点会重复出现，需去重，否则折线出现折返抖动
         pts: List[Tuple[float, float]] = []
         steps = p0.get("steps") or []
         for st in steps:
             poly = st.get("polyline") or ""
-            if poly:
-                pts.extend(decode_amap_polyline(poly))
+            if not poly:
+                continue
+            seg_pts = decode_amap_polyline(poly)
+            for pt in seg_pts:
+                if pts and abs(pts[-1][0] - pt[0]) < 1e-7 and abs(pts[-1][1] - pt[1]) < 1e-7:
+                    continue
+                pts.append(pt)
         # extensions=base 时 steps 内无 polyline，退回顶层 polyline
         if not pts and p0.get("polyline"):
             pts = decode_amap_polyline(p0["polyline"])
@@ -261,9 +330,10 @@ class AmapClient:
 
         print(f"  高德距离矩阵：{n} 个点，需 {n} 次请求（按请求计费）")
 
-        for j in range(n):
+        def _fetch_column(j: int) -> int:
+            """以 j 为终点，一次请求取回其余全部起点，返回成功填充的对数。"""
             d_lng, d_lat = pts_gcj[j]
-            # 以 j 为终点，把其余点全部作为起点（分批，每批 ≤100）
+            filled = 0
             origins_all = [(i, pts_gcj[i]) for i in range(n) if i != j]
             for start in range(0, len(origins_all), MAX_ORIGINS):
                 batch = origins_all[start:start + MAX_ORIGINS]
@@ -296,9 +366,54 @@ class AmapClient:
                         # 缺耗时：按 30km/h 兜底估算，保证时长约束可用
                         dur_f = dist_f / 1000.0 / 30.0 * 3600
                     matrix[i][j] = (dist_f, dur_f)
+                    filled += 1
+            return filled
 
-            done = j + 1
-            print(f"  高德距离矩阵进度: {done}/{n}")
+        for j in range(n):
+            _fetch_column(j)
+            print(f"  高德距离矩阵进度: {j + 1}/{n}")
+
+        # ---- 空洞补齐：限流/网络抖动导致的缺失对逐个重试 ----
+        missing = [(i, j) for i in range(n) for j in range(n)
+                   if i != j and matrix[i][j] is None]
+        if missing:
+            print(f"  高德矩阵有 {len(missing)} 对缺失（多为限流），开始逐点补齐...")
+            by_dest = {}
+            for i, j in missing:
+                by_dest.setdefault(j, []).append(i)
+            still_missing = 0
+            for j, origins_idx in by_dest.items():
+                d_lng, d_lat = pts_gcj[j]
+                origins_str = "|".join(f"{pts_gcj[i][0]},{pts_gcj[i][1]}" for i in origins_idx)
+                data = self._request(DISTANCE_PATH, {
+                    "origins": origins_str,
+                    "destination": f"{d_lng},{d_lat}",
+                    "type": 1,
+                }, retries=4)
+                if not data:
+                    still_missing += len(origins_idx)
+                    continue
+                for idx, res in enumerate(data.get("results") or []):
+                    if idx >= len(origins_idx):
+                        break
+                    i = origins_idx[idx]
+                    try:
+                        dist_f = float(res.get("distance"))
+                        dur_f = float(res.get("duration") or 0)
+                    except (TypeError, ValueError):
+                        still_missing += 1
+                        continue
+                    if dist_f < 0:
+                        still_missing += 1
+                        continue
+                    matrix[i][j] = (dist_f, dur_f if dur_f > 0
+                                    else dist_f / 1000.0 / 30.0 * 3600)
+            recovered = len(missing) - still_missing
+            print(f"  补齐完成：恢复 {recovered}/{len(missing)} 对"
+                  + (f"，仍缺失 {still_missing} 对" if still_missing else "，矩阵完整"))
+            if still_missing:
+                print("  提示：持续缺失通常意味着 QPS 超限，可在 .env 中调大 "
+                      "AMAP_QPS_DELAY（默认 0.35 秒）")
 
         return matrix
 
