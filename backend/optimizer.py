@@ -14,6 +14,9 @@
 A9 人均车费上限与「建议剔除」要点：
 - 人均车费 = 拼车总费用 / 参与人数（乘客实付，无补贴）；
 - 被剔除者不再参加活动（不产生成本、不计入分母）；算法只给建议，人工确认后才执行；
+- 剔除主键是乘客的**稳定 id**（`Passenger.id`）而非姓名：姓名可重名，
+  按姓名剔除会把同名的其他人一并连坐。建议结果同时给出 `drop_ids`（执行用）
+  与 `drop_names`（展示用），两者按乘客原始顺序一一对应；
 - 总费用是**车数的阶梯函数**，故剔人**非单调**降人均：候选须覆盖「距离前缀」与
   「整车剔除」两类，仅剔最远的人可能反而抬高总费用（实测 ¥212.78 → ¥222.66）。
 
@@ -405,6 +408,22 @@ def per_capita_cost(total_cost: float, served_count: int) -> Optional[float]:
     return float(total_cost) / float(served_count)
 
 
+def split_excluded(passengers: List[Passenger], exclude_ids: Optional[List[str]]
+                   ) -> Tuple[List[Passenger], List[Passenger]]:
+    """
+    A9：按**稳定 id** 把名单拆成「保留 / 被剔除」两组，两者都是原名单的子序列。
+
+    为什么主键必须是 id 而不是姓名：姓名可重名（一批名单里出现两个「张伟」很常见），
+    按姓名剔除会把同名的其他人一并连坐——被连坐的人失去参加活动的资格，
+    这是业务上立刻会暴露的错误。id 由前端按行分配、并在「剔除并重算」的
+    两次提交之间保持不变，剔除才落到唯一一个人身上。
+    """
+    excl = {str(i).strip() for i in (exclude_ids or []) if str(i).strip()}
+    kept = [p for p in passengers if p.id not in excl]
+    dropped = [p for p in passengers if p.id in excl]
+    return kept, dropped
+
+
 def subset_matrix(dm: DistanceMatrix, keep_idx: List[int], dest_idx: int) -> DistanceMatrix:
     """
     A9：从整张矩阵裁出「子集 + 终点」的小方阵，供剔除后重解使用。
@@ -448,6 +467,7 @@ def suggest_drops(passengers: List[Passenger], dest: Passenger, dm: DistanceMatr
     verify_top     : 真实求解的候选数；**下限 3**（达标候选×2 + 估算最优 + 最保守）。
 
     返回 dict（可直接序列化）；cap 为 None 或人数不足时返回 None。
+    每个建议项同时带 `drop_ids`（稳定 id，执行口径）与 `drop_names`（展示口径）。
     """
     n = len(passengers)
     if cap is None or n <= min_served:
@@ -484,8 +504,9 @@ def suggest_drops(passengers: List[Passenger], dest: Passenger, dm: DistanceMatr
     c2_plans = []
     if current_vehicles:
         for v in current_vehicles:
-            names = {p.name for p in v.passengers}
-            idxs = frozenset(i for i in range(n) if passengers[i].name in names)
+            # 按**稳定 id** 圈人，而不是姓名（同名乘客不会被一并圈进来）
+            pids = {p.id for p in v.passengers}
+            idxs = frozenset(i for i in range(n) if passengers[i].id in pids)
             if idxs and len(idxs) <= n - min_served:
                 c2_plans.append((idxs, f"整辆剔除 {v.passengers[0].name} 等 {len(idxs)} 人所在车"))
 
@@ -549,6 +570,9 @@ def suggest_drops(passengers: List[Passenger], dest: Passenger, dm: DistanceMatr
             total = sum(v.cost for v in best)
             cnt = len(e["keep_idx"])
             verified.append({
+                # drop_ids 是**执行口径**（前端原样带回 exclude_ids），
+                # drop_names 只是给人看的展示口径，两者同序一一对应。
+                "drop_ids": [passengers[i].id for i in range(n) if i in e["drop_idx"]],
                 "drop_names": [passengers[i].name for i in range(n) if i in e["drop_idx"]],
                 "drop_count": n - cnt,
                 "keep_count": cnt,

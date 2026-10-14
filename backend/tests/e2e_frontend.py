@@ -323,6 +323,16 @@ def main():
               (rows or {}).get("count", ""))
 
         print("\n=== 6. 提交任务并验证地图渲染 ===")
+        # A9：上限是下拉选项（不限 + ¥2 起、步进 ¥2），便于横向对比不同上限下的方案
+        cap_sel = evaluate(send, """(() => {
+          const sel = document.getElementById('per_capita_cap');
+          return { tag: sel ? sel.tagName : null,
+                   vals: sel ? Array.from(sel.options).map(o => o.value) : [] };
+        })()""") or {}
+        check("人均上限是下拉选项（不限 + ¥2 起、步进 ¥2）",
+              cap_sel.get("tag") == "SELECT"
+              and cap_sel.get("vals") == [''] + [str(v) for v in range(2, 31, 2)],
+              str(cap_sel.get("vals")))
         # A9：先设一个人均上限（示例名单 15 人，人均必然超过 ¥10），
         # 用于验证「超上限 → 给出建议 → 人工确认 → 重算」这条闭环
         evaluate(send, "document.getElementById('per_capita_cap').value = '10'")
@@ -414,9 +424,10 @@ def main():
             cap: r.per_capita_cap, pc: r.per_capita_cost, total: r.total_cost,
             served: r.served_count, exceeded: r.exceeded,
             achievable: s ? s.achievable : null,
+            ids: (s && s.best) ? (s.best.drop_ids || []) : [],
             names: (s && s.best) ? s.best.drop_names : [],
             note: s ? s.note : '',
-            pending: window.PENDING_DROP_NAMES || []
+            pendingIds: window.PENDING_DROP_IDS || []
           };
         })()""") or {}
         check("结果列表头展示人均车费与上限",
@@ -432,11 +443,14 @@ def main():
         check("建议名单非空且不是把人全剔了",
               bool(a9.get("names")) and len(a9.get("names")) < 15,
               str(a9.get("names")))
+        check("建议同时给出稳定 id 与姓名，两者等长同序",
+              len(a9.get("ids") or []) == len(a9.get("names") or []) > 0,
+              f'ids={a9.get("ids")} names={a9.get("names")}')
         check("建议文案说清了可达性与根因", bool(a9.get("note")),
               (a9.get("note") or "")[:70])
-        check("建议名单已挂到 PENDING_DROP_NAMES（点按钮才生效，不自动剔除）",
-              a9.get("pending") == a9.get("names"),
-              str(a9.get("pending")))
+        check("建议名单已挂到 PENDING_DROP_IDS（点按钮才生效，不自动剔除）",
+              a9.get("pendingIds") == a9.get("ids"),
+              f'pending={a9.get("pendingIds")} ids={a9.get("ids")}')
         # 备选方案区：达标方案未必是业务最优，取舍必须摊开给人看
         a9alt = evaluate(send, """(() => {
           const opts = window.PENDING_DROP_OPTIONS || [];
@@ -487,9 +501,10 @@ def main():
                   str([v.get("vehicle_type") for v in (r0.get("vehicles") or [])]))
 
         # 6a. A9：人工确认「剔除并重算」→ 被剔者真的不再参与，人均随之重算
+        drop_ids = a9.get("ids") or []
         drop_names = a9.get("names") or []
         old_tid = tid
-        if drop_names:
+        if drop_ids:
             print("\n=== 6a. A9：人工确认剔除后重算 ===")
             evaluate(send, "applyPendingDrops()")
             ok2 = False
@@ -506,19 +521,27 @@ def main():
                 after = evaluate(send, """(() => { const r = currentResult || {}; return {
                     served: r.served_count,
                     excluded: r.excluded_names || [],
+                    excludedIds: r.excluded_ids || [],
+                    ids: (r.vehicles || []).reduce(
+                        (a, v) => a.concat((v.passengers || []).map(p => p.passenger_id)), []),
                     names: (r.vehicles || []).reduce(
                         (a, v) => a.concat((v.passengers || []).map(p => p.name)), []),
                     total: r.total_cost, pc: r.per_capita_cost
                 }; })()""") or {}
                 check("参与人数 = 原人数 − 剔除数",
-                      after.get("served") == 15 - len(drop_names),
-                      f'{after.get("served")} vs 15 - {len(drop_names)}')
-                still = sorted(set(drop_names) & set(after.get("names") or []))
-                check("被剔除者确实不在方案里（不再参加活动）", not still,
-                      f'剔除 {drop_names}；仍在方案 {still}')
-                check("excluded_names 回显给前端",
-                      set(after.get("excluded") or []) == set(drop_names),
-                      str(after.get("excluded")))
+                      after.get("served") == 15 - len(drop_ids),
+                      f'{after.get("served")} vs 15 - {len(drop_ids)}')
+                # 按**稳定 id** 断言，比按姓名更严格：同名乘客也不会误判
+                still = sorted(set(drop_ids) & set(after.get("ids") or []))
+                check("被剔除者确实不在方案里（按稳定 id 核对，不再参加活动）",
+                      not still, f'剔除 {drop_ids}；仍在方案 {still}')
+                check("被剔者的姓名也不在方案里",
+                      not (set(drop_names) & set(after.get("names") or [])),
+                      f'剔除 {drop_names}')
+                check("excluded_ids 与 excluded_names 都回显给前端",
+                      set(after.get("excludedIds") or []) == set(drop_ids)
+                      and set(after.get("excluded") or []) == set(drop_names),
+                      f'{after.get("excludedIds")} / {after.get("excluded")}')
                 check("人均按「新总费用 ÷ 新参与人数」重算",
                       after.get("pc") is not None and after.get("served")
                       and abs(after["pc"] * after["served"] - after["total"]) < 0.05,

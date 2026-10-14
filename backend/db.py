@@ -120,6 +120,10 @@ CREATE TABLE IF NOT EXISTS carpool_task (
     budget_second    INTEGER,
     max_vehicles     INTEGER,
     baseline_cost    REAL,
+    -- A9：本轮「人工确认后剔除」的乘客（JSON 数组）。被剔除者不写进 passenger 表，
+    -- 故单独存一份，进程重启后仍能如实回显剔除名单。
+    excluded_ids     TEXT,
+    excluded_names   TEXT,
     created_at       TEXT    NOT NULL,
     updated_at       TEXT
 );
@@ -130,7 +134,8 @@ CREATE TABLE IF NOT EXISTS passenger (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id  INTEGER NOT NULL REFERENCES carpool_task(id) ON DELETE CASCADE,
     seq      INTEGER NOT NULL,                          -- 提交顺序（0 起）
-    pax_code TEXT,                                      -- P001 / P002 ...
+    pax_code TEXT,                                      -- P001 / P002 ...（库内序号）
+    ext_id   TEXT,                                      -- A9：前端分配的稳定 id（剔除主键）
     name     TEXT    NOT NULL,
     address  TEXT,
     lat      REAL,
@@ -223,6 +228,7 @@ CREATE TABLE IF NOT EXISTS route_passenger (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     route_id          INTEGER NOT NULL REFERENCES vehicle_route(id) ON DELETE CASCADE,
     passenger_id      INTEGER,
+    passenger_ext_id  TEXT,                             -- A9：乘客稳定 id（前端分配）
     passenger_name    TEXT    NOT NULL,
     sequence_no       INTEGER NOT NULL,
     direct_duration   INTEGER,
@@ -257,9 +263,18 @@ _EXTRA_COLUMNS = {
         "lower_bound": "REAL",
         "stop_reason": "TEXT",
     },
-    # A9：人均车费上限（元/人）。老库就地补列，避免新建库脚本与老库结构分叉。
+    # A9：人均车费上限（元/人）+ 已剔除名单。老库就地补列，避免新库脚本与老库结构分叉。
     "carpool_task": {
         "per_capita_cap": "REAL",
+        "excluded_ids": "TEXT",
+        "excluded_names": "TEXT",
+    },
+    # A9：乘客稳定 id（剔除主键）。姓名可重名，不能当主键。
+    "passenger": {
+        "ext_id": "TEXT",
+    },
+    "route_passenger": {
+        "passenger_ext_id": "TEXT",
     },
 }
 
@@ -333,23 +348,51 @@ def _point_key(lat: float, lng: float) -> str:
     return "%.6f,%.6f" % (_num(lat), _num(lng))
 
 
+def _json_list(v) -> Optional[str]:
+    """字符串列表 → JSON 文本。空/None → NULL（不让库里同时存在 '[]' 与 NULL 两种空值）。"""
+    if not v:
+        return None
+    try:
+        return json.dumps(list(v), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_json_list(v) -> List[Any]:
+    """JSON 文本 → 列表。NULL / 坏数据 / 非数组统一回空列表（老库无该列时也是这路径）。"""
+    if not v:
+        return []
+    try:
+        out = json.loads(v)
+        return list(out) if isinstance(out, list) else []
+    except (TypeError, ValueError):
+        return []
+
+
 # ============ 任务 ============
 def save_task(meta: Dict[str, Any]) -> Optional[int]:
-    """插入任务，返回自增主键（失败返回 None）。"""
+    """插入任务，返回自增主键（失败返回 None）。
+
+    A9：excluded_ids / excluded_names 以 JSON 数组落库（被剔除者不进 passenger 表，
+    故必须单独存一份，重启后才能如实回显「本轮剔了谁」）。
+    """
     cur = _execute(
         """INSERT INTO carpool_task
            (task_code, task_name, status, passenger_count, destination_name,
             destination_lng, destination_lat, coordinate_type, vehicle_mode,
             optimization_mode, direction, budget_second, max_vehicles,
-            baseline_cost, per_capita_cap, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            baseline_cost, per_capita_cap, excluded_ids, excluded_names,
+            created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (meta["task_code"], meta.get("task_name"), meta.get("status", TASK_CREATED),
          meta.get("passenger_count", 0), meta.get("destination_name"),
          meta.get("destination_lng"), meta.get("destination_lat"),
          meta.get("coordinate_type", "BD09"), meta.get("vehicle_mode", "auto"),
          meta.get("optimization_mode", "cost"), meta.get("direction", "pickup"),
          meta.get("budget_second"), meta.get("max_vehicles"),
-         meta.get("baseline_cost"), meta.get("per_capita_cap"), now_iso(), now_iso()))
+         meta.get("baseline_cost"), meta.get("per_capita_cap"),
+         _json_list(meta.get("excluded_ids")), _json_list(meta.get("excluded_names")),
+         now_iso(), now_iso()))
     return cur.lastrowid if cur is not None else None
 
 
@@ -374,9 +417,9 @@ def save_passengers(task_id: int, passengers: List[Dict[str, Any]]) -> None:
         with conn:
             conn.executemany(
                 """INSERT INTO passenger
-                   (task_id, seq, pax_code, name, address, lat, lng, status)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                [(task_id, i, f"P{i+1:03d}", p.get("name") or "",
+                   (task_id, seq, pax_code, ext_id, name, address, lat, lng, status)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                [(task_id, i, f"P{i+1:03d}", p.get("id"), p.get("name") or "",
                   p.get("address"), p.get("lat"), p.get("lng"),
                   p.get("status", "")) for i, p in enumerate(passengers)])
     except Exception as e:  # noqa: BLE001
@@ -484,14 +527,14 @@ def save_solution(task_id: int, job_id: Optional[int], result: Dict[str, Any]) -
                 route_id = vcur.lastrowid
                 conn.executemany(
                     """INSERT INTO route_passenger
-                       (route_id, passenger_id, passenger_name, sequence_no,
-                        direct_duration, ride_duration, increase_duration,
+                       (route_id, passenger_id, passenger_ext_id, passenger_name,
+                        sequence_no, direct_duration, ride_duration, increase_duration,
                         detour_ratio, allocated_cost, warning)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                    [(route_id, None, p.get("name"), p.get("sequence_no"),
-                      p.get("direct_duration_s"), p.get("ride_duration_s"),
-                      p.get("increase_duration_s"), p.get("detour_ratio"),
-                      p.get("allocated_cost"), p.get("warning"))
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    [(route_id, None, p.get("passenger_id"), p.get("name"),
+                      p.get("sequence_no"), p.get("direct_duration_s"),
+                      p.get("ride_duration_s"), p.get("increase_duration_s"),
+                      p.get("detour_ratio"), p.get("allocated_cost"), p.get("warning"))
                      for p in (v.get("passengers") or [])])
     except Exception as e:  # noqa: BLE001
         print(f"  [db] 方案写入失败: {e}")
@@ -520,7 +563,10 @@ def load_result(task_code: str, job: Optional[Dict[str, Any]] = None
     job 为 optimization_job 行时，把 A8 的 8 态状态一并带进结果里。
     """
     rows = _query(
-        """SELECT s.*, t.per_capita_cap AS task_per_capita_cap FROM solution s
+        """SELECT s.*, t.per_capita_cap AS task_per_capita_cap,
+                  t.excluded_ids AS task_excluded_ids,
+                  t.excluded_names AS task_excluded_names
+           FROM solution s
            JOIN carpool_task t ON t.id = s.task_id
            WHERE t.task_code = ? AND s.is_best = 1
            ORDER BY s.id DESC LIMIT 1""", (task_code,))
@@ -544,6 +590,7 @@ def load_result(task_code: str, job: Optional[Dict[str, Any]] = None
             "path": json.loads(v["polyline"] or "[]"),
             "leg_durations": json.loads(v["leg_durations"] or "[]"),
             "passengers": [{
+                "passenger_id": p["passenger_ext_id"] or "",
                 "name": p["passenger_name"],
                 "sequence_no": p["sequence_no"],
                 "direct_duration_s": p["direct_duration"],
@@ -583,11 +630,12 @@ def load_result(task_code: str, job: Optional[Dict[str, Any]] = None
         "vehicles": vehicles,
         "error": None,
         "warning": sol["warning"],
-        # A9：恢复出的人均（上限与建议不落库，见 v1.1/A9 说明文档「已知限制」）
+        # A9：恢复出的人均（上限与剔除名单都落库，重启后仍能如实回显）
         "served_count": served,
         "per_capita_cost": pc,
         "per_capita_cap": sol.get("task_per_capita_cap"),
-        "excluded_names": [],
+        "excluded_ids": _load_json_list(sol.get("task_excluded_ids")),
+        "excluded_names": _load_json_list(sol.get("task_excluded_names")),
         "drop_suggestion": None,
         "_restored_from_db": True,   # 标记：结果来自 SQLite 而非进程内存
     }

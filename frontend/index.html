@@ -157,8 +157,25 @@
         </div>
         <div style="margin-bottom:14px;">
           <p class="field-label">人均车费上限（可选）</p>
-          <input class="text-input" id="per_capita_cap" type="number" min="0.01" step="0.5" placeholder="不限">
-          <p style="font-size:11px; color:#c0c4cc; margin:4px 0 0;">人均 = 总车费 ÷ 参与人数。超限时只给「建议剔除」名单，不会自动剔除，需你确认后重算</p>
+          <select class="text-input" id="per_capita_cap">
+            <option value="">不限</option>
+            <option value="2">¥2 / 人</option>
+            <option value="4">¥4 / 人</option>
+            <option value="6">¥6 / 人</option>
+            <option value="8">¥8 / 人</option>
+            <option value="10">¥10 / 人</option>
+            <option value="12">¥12 / 人</option>
+            <option value="14">¥14 / 人</option>
+            <option value="16">¥16 / 人</option>
+            <option value="18">¥18 / 人</option>
+            <option value="20">¥20 / 人</option>
+            <option value="22">¥22 / 人</option>
+            <option value="24">¥24 / 人</option>
+            <option value="26">¥26 / 人</option>
+            <option value="28">¥28 / 人</option>
+            <option value="30">¥30 / 人</option>
+          </select>
+          <p style="font-size:11px; color:#c0c4cc; margin:4px 0 0;">人均 = 总车费 ÷ 参与人数。超限时只给「建议剔除」名单，不会自动剔除，需你确认后重算。步进 ¥2，便于横向对比不同上限下的方案</p>
         </div>
         <div style="margin-bottom:14px;">
           <p class="field-label">求解预算（秒）</p>
@@ -290,8 +307,17 @@ let elapsedTimer = null;
 let currentDirection = 'pickup';
 let currentResult = null;
 let visibleVehicles = new Set();
-let passengers = [];       // {name, address, lat, lng, status: ok|fail|''}
+let passengers = [];       // {id, name, address, lat, lng, status: ok|fail|''}
+// A9：乘客稳定 id 计数器。id 只增不减、删除行不回收，
+// 这样「剔除并重算」两次提交之间同一名乘客的 id 不变，剔除才落到唯一一个人身上
+// （姓名可重名，不能当主键）。
+let pidSeq = 0;
 let geoQueue = Promise.resolve();
+
+// 按稳定 id 取乘客行（不要再用数组下标：删行后下标会整体前移）
+function byPid(pid) {
+  return passengers.find(p => p.id === pid) || null;
+}
 
 // ---------- 坐标系转换 ----------
 // 后端对外统一使用 BD09（百度坐标），高德底图使用 GCJ-02（火星坐标），
@@ -476,57 +502,58 @@ function setDirection(dir) {
 
 // ---------- 名单表格 ----------
 function addRow(name, address, lat, lng, status) {
-  const i = passengers.length;
-  passengers.push({ name: name || '', address: address || '', lat: lat || null,
-                    lng: lng || null, status: status || '' });
+  const id = 'p' + (++pidSeq);            // A9：稳定 id，删行不回收、不重排
+  passengers.push({ id: id, name: name || '', address: address || '',
+                    lat: lat || null, lng: lng || null, status: status || '' });
   const div = document.createElement('div');
   div.className = 'row-line';
-  div.dataset.i = i;
+  div.dataset.pid = id;                   // 用稳定 id 定位，而不是数组下标
   div.innerHTML =
       '<input class="text-input in-name" placeholder="姓名" value="' + (name || '') + '">' +
       '<input class="text-input in-addr" placeholder="地址，如：汉庭酒店郑州东站店" value="' + (address || '') + '">' +
-      '<span class="status-tag" id="row_st_' + i + '"></span>' +
+      '<span class="status-tag" id="row_st_' + id + '"></span>' +
       '<button class="row-del" title="删除本行">×</button>';
   document.getElementById('passenger_rows').appendChild(div);
   const nameInput = div.querySelector('.in-name');
   const addrInput = div.querySelector('.in-addr');
-  nameInput.addEventListener('input', () => { passengers[i].name = nameInput.value.trim(); });
+  nameInput.addEventListener('input', () => {
+    const p = byPid(id); if (p) p.name = nameInput.value.trim();
+  });
   addrInput.addEventListener('change', () => {
-    passengers[i].address = addrInput.value.trim();
-    geocodeRow(i);
+    const p = byPid(id);
+    if (p) { p.address = addrInput.value.trim(); geocodeRow(p); }
   });
   div.querySelector('.row-del').addEventListener('click', () => removeRow(div));
-  setRowStatus(i);
+  setRowStatus(byPid(id));
   updateRowsCount();
 }
 
 function removeRow(rowEl) {
-  const i = parseInt(rowEl.dataset.i, 10);
-  passengers.splice(i, 1);
+  const pid = rowEl.dataset.pid;
+  const idx = passengers.findIndex(p => p.id === pid);
+  if (idx >= 0) passengers.splice(idx, 1);
   rowEl.remove();
-  // 重建索引与 data-i，保证 passengers 与 DOM 对齐
-  const rows = document.querySelectorAll('#passenger_rows .row-line');
-  passengers.forEach((p, idx) => { rows[idx].dataset.i = idx; });
+  // 稳定 id 与顺序解耦，这里不再需要重建下标
   updateRowsCount();
 }
 
-function setRowStatus(i) {
-  const tag = document.getElementById('row_st_' + i);
-  const p = passengers[i];
-  if (!tag || !p) return;
+function setRowStatus(p) {
+  if (!p) return;
+  const tag = document.getElementById('row_st_' + p.id);
+  if (!tag) return;
   if (p.status === 'ok') { tag.className = 'status-tag st-ok'; tag.textContent = '已解析'; }
   else if (p.status === 'fail') { tag.className = 'status-tag st-fail'; tag.textContent = '定位失败'; }
   else if (p.status === 'wait') { tag.className = 'status-tag st-wait'; tag.textContent = '解析中'; }
   else { tag.className = 'status-tag'; tag.textContent = ''; }
 }
 
-function geocodeRow(i) {
-  const p = passengers[i];
-  if (!p || !p.address) {
+function geocodeRow(p) {
+  if (!p) return;
+  if (!p.address) {
     p.lat = p.lng = null; p.status = '';
-    setRowStatus(i); updateRowsCount(); return;
+    setRowStatus(p); updateRowsCount(); return;
   }
-  p.status = 'wait'; setRowStatus(i);
+  p.status = 'wait'; setRowStatus(p);
   // 串行队列，避免并发打满后端与地图服务的 QPS
   geoQueue = geoQueue.then(() => lookupAddress(p.address).then(data => {
     // 后端已返回 BD09，与内部存储一致
@@ -536,7 +563,7 @@ function geocodeRow(i) {
     p.lat = p.lng = null; p.status = 'fail';
     console.error('地址解析失败:', p.address, e);
   })).then(() => {
-    setRowStatus(i); updateRowsCount();
+    setRowStatus(p); updateRowsCount();
   });
 }
 
@@ -617,15 +644,15 @@ function openConfirm() {
   document.getElementById('confirm_mask').style.display = 'block';
 }
 
-// 组装提交体。excludeNames = A9 人工确认后要剔除的乘客姓名
+// 组装提交体。excludeIds = A9 人工确认后要剔除的乘客**稳定 id**
 // （被剔除者不再参加活动：不计入人均分母、也不进方案）
-function buildPayload(excludeNames) {
+function buildPayload(excludeIds) {
   const ps = collectPassengers();
   const mvRaw = document.getElementById('max_vehicles').value.trim();
-  const capRaw = document.getElementById('per_capita_cap').value.trim();
+  const capRaw = document.getElementById('per_capita_cap').value;   // select：'' = 不限
   const cap = capRaw === '' ? null : Number(capRaw);
   return {
-    passengers: ps.map(p => ({ name: p.name, lat: p.lat, lng: p.lng })),
+    passengers: ps.map(p => ({ id: p.id, name: p.name, lat: p.lat, lng: p.lng })),
     dest_lat: destPoint.lat,
     dest_lng: destPoint.lng,
     mode: document.getElementById('opt_mode').value,
@@ -634,7 +661,7 @@ function buildPayload(excludeNames) {
     max_vehicles: mvRaw === '' ? null : Math.max(1, parseInt(mvRaw, 10) || 1),
     per_capita_cap: (cap != null && cap > 0) ? cap : null,
     direction: currentDirection,
-    exclude_names: excludeNames || []
+    exclude_ids: excludeIds || []
   };
 }
 
@@ -644,20 +671,21 @@ function submitTask() {
   runTask(buildPayload([]));
 }
 
-// A9：组织者点「确认剔除并重算」→ 带 exclude_names 重新提交
-function applyDrops(names) {
-  if (!names || !names.length) return;
-  runTask(buildPayload(names));
+// A9：组织者点「确认剔除并重算」→ 带 exclude_ids 重新提交。
+// 主键是稳定 id（不是姓名）：同名乘客只剔中被点名的那一个。
+function applyDrops(ids) {
+  if (!ids || !ids.length) return;
+  runTask(buildPayload(ids));
 }
 
 function applyPendingDrops() {
-  applyDrops(window.PENDING_DROP_NAMES || []);
+  applyDrops(window.PENDING_DROP_IDS || []);
 }
 
 // A9：备选方案（例如「剔 3 人」比「剔 10 人达标」更划算，这个取舍由人来做）
 function applyPendingOption(i) {
   const o = (window.PENDING_DROP_OPTIONS || [])[i];
-  if (o && o.drop_names && o.drop_names.length) applyDrops(o.drop_names);
+  if (o && o.drop_ids && o.drop_ids.length) applyDrops(o.drop_ids);
 }
 
 async function runTask(payload) {
@@ -774,22 +802,27 @@ function escHTML(s) {
 
 // A9：超限时的「建议剔除」卡片。
 // 关键语义：算法**只给建议、绝不自动剔除**——被剔除者将不能参加活动，
-// 必须由组织者点「确认剔除并重算」把名单带回后端（exclude_names）。
+// 必须由组织者点「确认剔除并重算」把名单带回后端（exclude_ids）。
+// 带回的是建议项里的 drop_ids（稳定 id），不是姓名——同名乘客只剔被点名的那一个。
 function dropSuggestionHTML(r) {
-  window.PENDING_DROP_NAMES = [];
+  window.PENDING_DROP_IDS = [];
   window.PENDING_DROP_OPTIONS = [];
   const s = r && r.drop_suggestion;
   if (!s) return '';
   const best = s.best || {};
+  const ids = best.drop_ids || [];
   const names = best.drop_names || [];
   const opts = s.suggestions || [];
-  window.PENDING_DROP_NAMES = names;
+  window.PENDING_DROP_IDS = ids;
   window.PENDING_DROP_OPTIONS = opts;
   const ok = !!s.achievable;
-  const chips = names.map(n =>
+  // 名单里有重名时补一个稳定 id 角标，避免出现两个一模一样的 chip 让人分不清
+  const dup = names.length !== new Set(names).size;
+  const chips = names.map((n, i) =>
       '<span style="display:inline-block;padding:1px 7px;margin:2px 4px 2px 0;background:#fdf6ec;' +
       'border:1px solid #f5dab1;border-radius:4px;font-size:12px;color:#b88230;">' +
-      escHTML(n) + '</span>').join('');
+      escHTML(n) + (dup ? '<span style="color:#c0c4cc;"> #' + escHTML(ids[i] || '') + '</span>' : '') +
+      '</span>').join('');
   let html = '<div style="margin-top:12px;padding:10px 12px;border-radius:6px;background:' +
       (ok ? '#f0f9eb' : '#fef0f0') + ';border:1px solid ' +
       (ok ? '#e1f3d8' : '#fde2e2') + ';">';
@@ -881,8 +914,12 @@ function setStep(stage) {
 }
 
 // ---------- 结果展示 ----------
-function addrOf(name) {
-  const p = passengers.find(x => x.name === name);
+// A9：按**稳定 id** 反查地址（传姓名只是老结果的兜底）。
+// 同一批名单里出现两个「张伟」时，按姓名查会取到同一行——这是真实会发生的错配。
+function addrOf(key) {
+  if (!key) return '';
+  let p = passengers.find(x => x.id === key);
+  if (!p) p = passengers.find(x => x.name === key);
   return (p && p.address) ? p.address : '';
 }
 
@@ -999,7 +1036,7 @@ function resultText() {
     const legs = v.leg_durations || [];
     let t = start;
     v.coordinates.forEach((c, i) => {
-      const addr = addrOf(c.name);
+      const addr = addrOf(c.passenger_id || c.name);
       out += '  ' + fmtTime(t) + '  ' + c.name + (addr ? '（' + addr + '）' : '') + '\n';
       if (i < v.coordinates.length - 1 && legs[i] != null) t += legs[i];
     });
@@ -1046,16 +1083,22 @@ function exportCSV() {
   const start = parseTime(document.getElementById('depart_time').value);
   r.vehicles.forEach(v => {
     const legs = v.leg_durations || [];
-    // 乘客允许重名，故按出现顺序用队列一一对应，避免错配
+    // 坐标与个人明细一一对应：优先按**稳定 id** 匹配（重名也能分清），
+    // 老结果没有 passenger_id 时退回「按出现顺序用队列对应」
+    const byId = {};
     const queues = {};
-    (v.passengers || []).forEach(p => { (queues[p.name] = queues[p.name] || []).push(p); });
-    const take = name => (queues[name] && queues[name].length) ? queues[name].shift() : null;
+    (v.passengers || []).forEach(p => {
+      if (p.passenger_id) byId[p.passenger_id] = p;
+      (queues[p.name] = queues[p.name] || []).push(p);
+    });
+    const take = c => (c.passenger_id && byId[c.passenger_id]) ||
+        ((queues[c.name] && queues[c.name].length) ? queues[c.name].shift() : null);
     let t = start;
     v.coordinates.forEach((c, i) => {
-      const p = take(c.name);
+      const p = take(c);
       rows.push([
         v.vehicle_id, (v.vehicle_type || 6) + '座', i + 1, c.name,
-        addrOf(c.name), fmtTime(t),
+        addrOf(c.passenger_id || c.name), fmtTime(t),
         p ? p.allocated_cost.toFixed(2) : '',
         p ? Math.round(p.ride_duration_s / 60) : '',
         p ? Math.round(p.direct_duration_s / 60) : '',

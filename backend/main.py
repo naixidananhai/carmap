@@ -31,7 +31,7 @@ from optimizer import (Passenger, DistanceMatrix, optimize,
                        VEHICLE_PREFS, VEHICLE_PREF_AUTO,
                        normalize_vehicle_pref, capacity_limit,
                        assign_vehicle_type, count_vehicle_types,
-                       per_capita_cost, suggest_drops,
+                       per_capita_cost, suggest_drops, split_excluded,
                        PER_CAPITA_MIN_SERVED)
 from map_provider import create_provider
 
@@ -95,6 +95,10 @@ def normalize_mode(mode: Optional[str]) -> str:
 
 # ============ 数据模型 ============
 class PassengerIn(BaseModel):
+    # A9：乘客**稳定 id**。由前端按行分配，并在「剔除并重算」的两次提交之间保持不变，
+    # 是剔除与去重的**唯一主键**（姓名可重名，不能当主键）。
+    # 不传时按提交顺序回退 P001/P002...，兼容手工调 API 的旧客户端。
+    id: Optional[str] = None
     name: str
     address: Optional[str] = None
     lat: Optional[float] = None
@@ -122,9 +126,10 @@ class TaskCreate(BaseModel):
     # A9 人均车费上限（元/人，乘客实付口径）。null=不约束。
     # 超过上限时后端会给出「建议剔除名单」，但**不会自动剔除**——必须人工确认后。
     per_capita_cap: Optional[float] = None
-    # A9 人工确认后要剔除的乘客姓名。被剔除者不再参加活动（不计入分母、不产生成本）。
-    # 前端拿到 drop_suggestion 后由组织者点「确认剔除并重算」，把名单带回来重新提交。
-    exclude_names: List[str] = []
+    # A9 人工确认后要剔除的乘客**稳定 id**。被剔除者不再参加活动（不计入分母、不产生成本）。
+    # 前端拿到 drop_suggestion 后由组织者点「确认剔除并重算」，把 drop_ids 带回来重新提交。
+    # 用 id 而不是姓名：姓名可重名，按姓名剔会连坐同名的其他人。
+    exclude_ids: List[str] = []
 
 
 class PassengerDetailOut(BaseModel):
@@ -133,6 +138,7 @@ class PassengerDetailOut(BaseModel):
     时长统一用**整数秒**（设计口径：内部按秒判定、展示再换算分钟），
     字段名加 _s 后缀以区别于本响应中既有的分钟制字段（如 leg_durations）。
     """
+    passenger_id: str = ""               # A9：乘客稳定 id（前端据此反查地址，避免同名错配）
     name: str
     sequence_no: int                     # 沿最终路线的访问顺序（1 起）：集合=上车顺序，散场=送达顺序
     direct_duration_s: int               # 起点直达终点的标准秒数（不拼车）
@@ -148,7 +154,9 @@ class VehicleOut(BaseModel):
     vehicle_type: int = 6  # A2：车型（4 / 6 座）。5~6 人必为 6 座，≤4 人按 vehicle_pref 派
     passenger_count: int
     order: List[str]  # 接人顺序（乘客名）
-    coordinates: List[dict] = []  # 接人顺序的坐标 [{lat, lng, name}, ...]
+    # 接人顺序的坐标 [{lat, lng, name, passenger_id}, ...]。
+    # A9：passenger_id 为乘客稳定 id，前端据此反查地址（姓名可重名，不能当主键）。
+    coordinates: List[dict] = []
     path: List[dict] = []  # 沿真实路网的折线点 [{lat, lng}, ...]，为空时前端降级为直线
     leg_durations: List[float] = []  # 每段耗时（分钟），与 coordinates 顺序对应，供前端时间线累加
     passengers: List[PassengerDetailOut] = []  # 个人乘车明细 + 分摊金额（与 order 同序）
@@ -180,7 +188,8 @@ class TaskResult(BaseModel):
     served_count: int = 0                 # 实际参与人数（= 坐车人数；被剔除者不在内）
     per_capita_cost: Optional[float] = None  # 人均车费 = total_cost / served_count
     per_capita_cap: Optional[float] = None   # 本次任务设置的人均上限（null=未设）
-    excluded_names: List[str] = []        # 本次**已剔除**的乘客（人工确认后带入）
+    excluded_ids: List[str] = []          # 本次**已剔除**者的稳定 id（人工确认后带入）
+    excluded_names: List[str] = []        # 同上，姓名口径（仅用于展示；主键是 excluded_ids）
     exceeded: bool = False                # 人均是否超上限
     # 算法给出的剔除建议（仅当超上限时产出）。**不会自动执行**，需人工确认。
     # 结构见 optimizer.suggest_drops：cap/current_per_capita/achievable/best/suggestions/note
@@ -340,6 +349,7 @@ def _job_payload(task: dict, result=None, error=None) -> dict:
             task.get("vehicle_pref", VEHICLE_PREF_AUTO), ""),
         # ---- A9：人均车费上限与本轮已剔除名单（结果里的 per_capita_cost 在 result 内）----
         "per_capita_cap": task.get("per_capita_cap"),
+        "excluded_ids": task.get("excluded_ids", []),
         "excluded_names": task.get("excluded_names", []),
         # ---- 兼容字段：旧前端用 stage 画进度点、用 status 判终态 ----
         "status": LEGACY_STATUS.get(job_status, "RUNNING"),
@@ -401,6 +411,7 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
                      stable_stop_s: Optional[float] = None,
                      vehicle_pref: str = VEHICLE_PREF_AUTO,
                      per_capita_cap: Optional[float] = None,
+                     excluded_ids: Optional[List[str]] = None,
                      excluded_names: Optional[List[str]] = None):
     task = TASKS[task_id]
     rec = JobRecorder(task, task.get("job_id"))
@@ -413,11 +424,11 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
         task["stage"] = "matrix"
         rec.status(db.JOB_INIT, task_status=db.TASK_MAPPING)
 
-        # 构建乘客对象
+        # 构建乘客对象（A9：稳定 id 已由 create_task 归一化落定，这里仅兜底）
         passengers = []
         for i, p in enumerate(passengers_in):
             passengers.append(Passenger(
-                id=f"P{i+1:03d}",
+                id=(p.id or "").strip() or f"P{i+1:03d}",
                 name=p.name,
                 lat=p.lat,
                 lng=p.lng,
@@ -515,9 +526,11 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
             # optimize 输出的 order 是「接人」语义：首站 → ... → 活动点。
             # 散场时反转为送人顺序「活动点 → ... → 末位」，坐标与折线同步反转
             seq = list(reversed(v.order)) if is_dropoff else list(v.order)
-            coords = [{"lat": p.lat, "lng": p.lng, "name": p.name} for p in seq]
+            coords = [{"lat": p.lat, "lng": p.lng, "name": p.name,
+                       "passenger_id": p.id} for p in seq]
             venue_coord = {"lat": dest.lat, "lng": dest.lng,
-                           "name": "活动点" if is_dropoff else "终点"}
+                           "name": "活动点" if is_dropoff else "终点",
+                           "passenger_id": dest.id}
             if is_dropoff:
                 coords.insert(0, venue_coord)
                 stops = [dest] + seq
@@ -557,6 +570,7 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
                         else _matrix_secs(dest_idx, pi)
                 increase_s = ride_s - direct_s
                 passengers_out.append(PassengerDetailOut(
+                    passenger_id=p.id,
                     name=p.name,
                     # 集合：stops=[p0..pk, 终点] → 序号 = k+1；散场：stops=[活动点, h0..hk] → 序号 = k
                     sequence_no=(k + 1) if not is_dropoff else k,
@@ -602,7 +616,7 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
 
         # ---- A9：人均车费 = 总费用 / 参与人数（乘客实付，无平台补贴）----
         # 超上限时**只搜索建议、不自动剔除**：剔除谁属于业务决策（被剔除者将不能参加活动），
-        # 必须由组织者在前端确认后，把名单通过 exclude_names 带回来重新提交。
+        # 必须由组织者在前端确认后，把 drop_ids 通过 exclude_ids 带回来重新提交。
         served = len(passengers)
         pc = per_capita_cost(total_cost, served)
         exceeded = bool(per_capita_cap is not None and pc is not None
@@ -647,6 +661,7 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
             served_count=served,
             per_capita_cost=round(pc, 2) if pc is not None else None,
             per_capita_cap=round(per_capita_cap, 2) if per_capita_cap is not None else None,
+            excluded_ids=list(excluded_ids or []),
             excluded_names=list(excluded_names or []),
             exceeded=exceeded,
             drop_suggestion=drop_suggestion,
@@ -738,6 +753,30 @@ def api_geocode(address: str = Query(..., min_length=1), city: str = "郑州市"
     return {"ok": True, "lng": loc[0], "lat": loc[1], "source": name}
 
 
+# ============ A9：乘客稳定 id ============
+def assign_passenger_ids(passengers: List[PassengerIn]) -> None:
+    """
+    给每名乘客落实**稳定 id**（原地修改），并拒绝重复 id。
+
+    · 前端已传 id → 原样保留。跨「剔除并重算」两次提交保持同一 id，剔除才精准；
+    · 未传（手工调 API / 旧客户端）→ 按提交顺序回退 P001/P002...；
+    · id 重复 → 400 直接拒绝：id 是剔除与去重的唯一主键，重复会让剔除连带误伤。
+
+    回退 id 与提交顺序绑定，而前端「剔除并重算」时提交的始终是**全量名单** + exclude_ids，
+    因此回退 id 在两次提交间也保持一致（不会因为剔了人就把后面的人往前顶）。
+    """
+    seen: dict = {}
+    for i, p in enumerate(passengers):
+        pid = (p.id or "").strip() or f"P{i+1:03d}"
+        if pid in seen:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"乘客 id 重复：{pid}（第 {seen[pid] + 1} 行与第 {i + 1} 行）。"
+                        f"id 是剔除与去重的唯一主键，请保证每名乘客的 id 唯一"))
+        seen[pid] = i
+        p.id = pid
+
+
 @app.post("/api/tasks", response_model=dict)
 def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
     task_id = str(uuid.uuid4())[:8]
@@ -745,11 +784,16 @@ def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
     mode = normalize_mode(req.mode)
     pref = normalize_vehicle_pref(req.vehicle_pref)
 
-    # ---- A9：把「人工确认后的剔除名单」从名单里摘掉 ----
+    # ---- A9：先给每名乘客落实稳定 id，再按 id 摘掉「人工确认后的剔除名单」----
     # 被剔除者**不再参加活动**：不产生成本、不计入人均分母、也不写进乘客表。
-    excl_set = {str(n).strip() for n in (req.exclude_names or []) if str(n).strip()}
-    kept = [p for p in req.passengers if p.name not in excl_set]
-    applied = [p.name for p in req.passengers if p.name in excl_set]
+    assign_passenger_ids(req.passengers)
+    pax = [Passenger(id=p.id, name=p.name, lat=p.lat, lng=p.lng)
+           for p in req.passengers]
+    kept_pax, dropped_pax = split_excluded(pax, req.exclude_ids)
+    kept_by_id = {p.id: p for p in req.passengers}
+    kept = [kept_by_id[p.id] for p in kept_pax]        # 保持提交顺序
+    applied_ids = [p.id for p in dropped_pax]
+    applied_names = [p.name for p in dropped_pax]
     if len(kept) < PER_CAPITA_MIN_SERVED:
         raise HTTPException(
             status_code=400,
@@ -774,6 +818,8 @@ def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
         "budget_second": req.time_budget_s,
         "max_vehicles": req.max_vehicles,
         "per_capita_cap": req.per_capita_cap,
+        "excluded_ids": applied_ids,
+        "excluded_names": applied_names,
     })
     db.save_passengers(db_task_id, [p.model_dump() for p in kept])
     job_id = db.create_job(db_task_id, req.time_budget_s)
@@ -789,7 +835,8 @@ def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
         "vehicle_pref": pref,
         "capacity_limit": capacity_limit(pref),
         "per_capita_cap": req.per_capita_cap,
-        "excluded_names": applied,
+        "excluded_ids": applied_ids,
+        "excluded_names": applied_names,
         # A8 状态字段初始值
         "task_status": db.TASK_CREATED,
         "task_status_text": TASK_STATUS_TEXT[db.TASK_CREATED],
@@ -812,14 +859,15 @@ def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
         run_optimization, task_id, kept,
         req.dest_lat, req.dest_lng, mode, req.time_budget_s, direction,
         req.max_vehicles, req.stable_stop_s, pref,
-        req.per_capita_cap, applied
+        req.per_capita_cap, applied_ids, applied_names
     )
     # status=CREATED 为设计文档口径；PENDING 为旧客户端兼容字段
     return {"task_id": task_id, "status": "PENDING",
             "task_status": db.TASK_CREATED, "job_status": db.JOB_INIT,
             "vehicle_pref": pref,
             "per_capita_cap": req.per_capita_cap,
-            "excluded_names": applied}
+            "excluded_ids": applied_ids,
+            "excluded_names": applied_names}
 
 
 @app.get("/api/tasks", response_model=dict)
@@ -873,6 +921,10 @@ def get_task(task_id: str):
         "vehicle_pref": trow.get("vehicle_mode") or VEHICLE_PREF_AUTO,
         "vehicle_pref_text": VEHICLE_PREF_TEXT.get(
             trow.get("vehicle_mode") or VEHICLE_PREF_AUTO, ""),
+        # A9：人均上限与已剔除名单（字段与 _job_payload 一致，两条读路径不可分叉）
+        "per_capita_cap": trow.get("per_capita_cap"),
+        "excluded_ids": (result or {}).get("excluded_ids") or [],
+        "excluded_names": (result or {}).get("excluded_names") or [],
         "status": LEGACY_STATUS.get(job_status, "RUNNING"),
         "stage": "done" if job_status in db.JOB_TERMINAL_OK else (
             "failed" if job_status == db.JOB_FAILED else "pending"),
