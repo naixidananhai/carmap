@@ -21,7 +21,7 @@ import uuid
 import time
 from typing import List, Optional
 from pydantic import BaseModel
-from fastapi import FastAPI, BackgroundTasks, Query
+from fastapi import FastAPI, BackgroundTasks, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import db
@@ -30,7 +30,9 @@ from optimizer import (Passenger, DistanceMatrix, optimize,
                        MAX_ROUTE_SECONDS,
                        VEHICLE_PREFS, VEHICLE_PREF_AUTO,
                        normalize_vehicle_pref, capacity_limit,
-                       assign_vehicle_type, count_vehicle_types)
+                       assign_vehicle_type, count_vehicle_types,
+                       per_capita_cost, suggest_drops,
+                       PER_CAPITA_MIN_SERVED)
 from map_provider import create_provider
 
 app = FastAPI(title="拼车路线优化系统", version="1.2")
@@ -117,6 +119,12 @@ class TaskCreate(BaseModel):
     #     0=关闭（跑满预算，实测多花约 50% 时间换约 1% 费用，见 v1.1/A7-A8 实现说明.md §5）
     stable_stop_s: Optional[float] = None
     task_name: Optional[str] = None
+    # A9 人均车费上限（元/人，乘客实付口径）。null=不约束。
+    # 超过上限时后端会给出「建议剔除名单」，但**不会自动剔除**——必须人工确认后。
+    per_capita_cap: Optional[float] = None
+    # A9 人工确认后要剔除的乘客姓名。被剔除者不再参加活动（不计入分母、不产生成本）。
+    # 前端拿到 drop_suggestion 后由组织者点「确认剔除并重算」，把名单带回来重新提交。
+    exclude_names: List[str] = []
 
 
 class PassengerDetailOut(BaseModel):
@@ -168,6 +176,15 @@ class TaskResult(BaseModel):
     vehicles: List[VehicleOut]
     error: Optional[str] = None
     warning: Optional[str] = None  # 例如「车数上限未能满足」
+    # ---- A9：人均车费与「建议剔除」 ----
+    served_count: int = 0                 # 实际参与人数（= 坐车人数；被剔除者不在内）
+    per_capita_cost: Optional[float] = None  # 人均车费 = total_cost / served_count
+    per_capita_cap: Optional[float] = None   # 本次任务设置的人均上限（null=未设）
+    excluded_names: List[str] = []        # 本次**已剔除**的乘客（人工确认后带入）
+    exceeded: bool = False                # 人均是否超上限
+    # 算法给出的剔除建议（仅当超上限时产出）。**不会自动执行**，需人工确认。
+    # 结构见 optimizer.suggest_drops：cap/current_per_capita/achievable/best/suggestions/note
+    drop_suggestion: Optional[dict] = None
 
 
 # ============ 作业状态记录（A8 写穿 SQLite） ============
@@ -321,6 +338,9 @@ def _job_payload(task: dict, result=None, error=None) -> dict:
         "vehicle_pref": task.get("vehicle_pref", VEHICLE_PREF_AUTO),
         "vehicle_pref_text": VEHICLE_PREF_TEXT.get(
             task.get("vehicle_pref", VEHICLE_PREF_AUTO), ""),
+        # ---- A9：人均车费上限与本轮已剔除名单（结果里的 per_capita_cost 在 result 内）----
+        "per_capita_cap": task.get("per_capita_cap"),
+        "excluded_names": task.get("excluded_names", []),
         # ---- 兼容字段：旧前端用 stage 画进度点、用 status 判终态 ----
         "status": LEGACY_STATUS.get(job_status, "RUNNING"),
         "stage": task.get("stage", "pending"),
@@ -379,13 +399,16 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
                      mode: str, time_budget_s: int, direction: str = "pickup",
                      max_vehicles: Optional[int] = None,
                      stable_stop_s: Optional[float] = None,
-                     vehicle_pref: str = VEHICLE_PREF_AUTO):
+                     vehicle_pref: str = VEHICLE_PREF_AUTO,
+                     per_capita_cap: Optional[float] = None,
+                     excluded_names: Optional[List[str]] = None):
     task = TASKS[task_id]
     rec = JobRecorder(task, task.get("job_id"))
     task["started_at"] = time.time()
     task["budget_s"] = time_budget_s
     pref = normalize_vehicle_pref(vehicle_pref)
     task["vehicle_pref"] = pref
+    task["per_capita_cap"] = per_capita_cap
     try:
         task["stage"] = "matrix"
         rec.status(db.JOB_INIT, task_status=db.TASK_MAPPING)
@@ -577,6 +600,31 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
             print(f"[任务 {task_id}] 不可行：{msg}")
             return
 
+        # ---- A9：人均车费 = 总费用 / 参与人数（乘客实付，无平台补贴）----
+        # 超上限时**只搜索建议、不自动剔除**：剔除谁属于业务决策（被剔除者将不能参加活动），
+        # 必须由组织者在前端确认后，把名单通过 exclude_names 带回来重新提交。
+        served = len(passengers)
+        pc = per_capita_cost(total_cost, served)
+        exceeded = bool(per_capita_cap is not None and pc is not None
+                        and pc > per_capita_cap + 1e-9)
+        drop_suggestion = None
+        if exceeded:
+            task["stage"] = "suggest"
+            print(f"[任务 {task_id}] 人均 ¥{pc:.2f} 超上限 ¥{per_capita_cap:.2f}，"
+                  f"搜索「建议剔除」名单（仅建议，需人工确认）...")
+            try:
+                drop_suggestion = suggest_drops(
+                    passengers, dest, dm, per_capita_cap,
+                    current_vehicles=best, current_total=total_cost,
+                    vehicle_pref=pref,
+                    verify_budget_s=max(1.0, min(3.0, time_budget_s / 10.0)))
+                if drop_suggestion:
+                    print(f"[任务 {task_id}] 建议：{drop_suggestion['note']}")
+            except Exception as e:  # noqa: BLE001
+                # 建议搜索失败不影响主结果交付
+                print(f"[任务 {task_id}] 剔除建议搜索失败（不影响主结果）: {e}")
+            task["stage"] = "done"
+
         result = TaskResult(
             task_id=task_id,
             status="DONE",
@@ -595,6 +643,13 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
             six_seat_count=job.get("six_seat_count", len(best)),
             vehicles=vehicles_out,
             warning=warning,
+            # A9
+            served_count=served,
+            per_capita_cost=round(pc, 2) if pc is not None else None,
+            per_capita_cap=round(per_capita_cap, 2) if per_capita_cap is not None else None,
+            excluded_names=list(excluded_names or []),
+            exceeded=exceeded,
+            drop_suggestion=drop_suggestion,
         )
         task["result"] = result
         task["stage"] = "done"
@@ -604,7 +659,8 @@ def run_optimization(task_id: str, passengers_in: List[PassengerIn],
         print(f"[任务 {task_id}] 完成：{job.get('status')}，"
               f"{len(best)} 辆车（4 座 {job.get('four_seat_count', 0)} / "
               f"6 座 {job.get('six_seat_count', 0)}），"
-              f"{total_cost:.2f} 元，{job.get('stop_reason')}")
+              f"{total_cost:.2f} 元 / {served} 人"
+              f"（人均 {('¥%.2f' % pc) if pc is not None else '—'}），{job.get('stop_reason')}")
 
     except Exception as e:
         import traceback
@@ -689,6 +745,18 @@ def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
     mode = normalize_mode(req.mode)
     pref = normalize_vehicle_pref(req.vehicle_pref)
 
+    # ---- A9：把「人工确认后的剔除名单」从名单里摘掉 ----
+    # 被剔除者**不再参加活动**：不产生成本、不计入人均分母、也不写进乘客表。
+    excl_set = {str(n).strip() for n in (req.exclude_names or []) if str(n).strip()}
+    kept = [p for p in req.passengers if p.name not in excl_set]
+    applied = [p.name for p in req.passengers if p.name in excl_set]
+    if len(kept) < PER_CAPITA_MIN_SERVED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"剔除后仅剩 {len(kept)} 人，低于最低成团人数 {PER_CAPITA_MIN_SERVED}")
+    if req.per_capita_cap is not None and req.per_capita_cap <= 0:
+        raise HTTPException(status_code=400, detail="人均车费上限必须大于 0")
+
     # A7：任务与名单先落库（CREATED）。这样即使进程在优化中途崩溃，
     # 提交内容仍可查，且 optimization_job 里能看出死在哪一个状态。
     # A2：车型偏好落到 carpool_task.vehicle_mode（数据库设计里本就预留该列）
@@ -696,7 +764,7 @@ def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
         "task_code": task_id,
         "task_name": req.task_name or (req.dest_address or "拼车任务"),
         "status": db.TASK_CREATED,
-        "passenger_count": len(req.passengers),
+        "passenger_count": len(kept),
         "destination_name": req.dest_address,
         "destination_lng": req.dest_lng,
         "destination_lat": req.dest_lat,
@@ -705,8 +773,9 @@ def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
         "direction": direction,
         "budget_second": req.time_budget_s,
         "max_vehicles": req.max_vehicles,
+        "per_capita_cap": req.per_capita_cap,
     })
-    db.save_passengers(db_task_id, [p.model_dump() for p in req.passengers])
+    db.save_passengers(db_task_id, [p.model_dump() for p in kept])
     job_id = db.create_job(db_task_id, req.time_budget_s)
 
     TASKS[task_id] = {
@@ -719,6 +788,8 @@ def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
         "stage": "pending",
         "vehicle_pref": pref,
         "capacity_limit": capacity_limit(pref),
+        "per_capita_cap": req.per_capita_cap,
+        "excluded_names": applied,
         # A8 状态字段初始值
         "task_status": db.TASK_CREATED,
         "task_status_text": TASK_STATUS_TEXT[db.TASK_CREATED],
@@ -738,14 +809,17 @@ def create_task(req: TaskCreate, background_tasks: BackgroundTasks):
         "status_text": JOB_STATUS_TEXT[db.JOB_INIT],
     }
     background_tasks.add_task(
-        run_optimization, task_id, req.passengers,
+        run_optimization, task_id, kept,
         req.dest_lat, req.dest_lng, mode, req.time_budget_s, direction,
-        req.max_vehicles, req.stable_stop_s, pref
+        req.max_vehicles, req.stable_stop_s, pref,
+        req.per_capita_cap, applied
     )
     # status=CREATED 为设计文档口径；PENDING 为旧客户端兼容字段
     return {"task_id": task_id, "status": "PENDING",
             "task_status": db.TASK_CREATED, "job_status": db.JOB_INIT,
-            "vehicle_pref": pref}
+            "vehicle_pref": pref,
+            "per_capita_cap": req.per_capita_cap,
+            "excluded_names": applied}
 
 
 @app.get("/api/tasks", response_model=dict)

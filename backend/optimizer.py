@@ -11,6 +11,12 @@
 - 费用函数：C(D) = 16 + 3 * max(D_km - 3, 0)   ← 不含车型项（两种车型同价）
 - 超时约束：单车路线 ≤ 5400 秒
 
+A9 人均车费上限与「建议剔除」要点：
+- 人均车费 = 拼车总费用 / 参与人数（乘客实付，无补贴）；
+- 被剔除者不再参加活动（不产生成本、不计入分母）；算法只给建议，人工确认后才执行；
+- 总费用是**车数的阶梯函数**，故剔人**非单调**降人均：候选须覆盖「距离前缀」与
+  「整车剔除」两类，仅剔最远的人可能反而抬高总费用（实测 ¥212.78 → ¥222.66）。
+
 A2 车型（4 座 / 6 座）实现要点：
 - 车型是**可行性变量**不是成本变量：起步价与里程单价对 4/6 座完全相同；
 - 「优先 6 人」落在**分组**上（按 6 座装填 → 车数最少 → 起步价最省），
@@ -370,6 +376,238 @@ def build_initial_solution(passengers: List[Passenger], dest: Passenger, dm: Dis
         )
         vehicles.append(v)
     return vehicles
+
+
+# ============ A9：人均车费上限与「建议剔除」 ============
+# 业务口径（已与业务方确认）：
+#   · 人均车费 = 拼车总费用 / 参与人数，**乘客实付**，无平台补贴；
+#   · 被剔除者**不再参加活动** → 既不产生成本，也不计入分母；
+#   · 算法只产出**建议**，是否执行由人工确认后触发重算。
+#
+# 为什么「剔人」不是单调降人均的（实测结论，详见 v1.1/A9 说明文档）：
+#   总费用是**车数的阶梯函数**（每车 16 元起步价 + 里程），
+#   剔除一个人而车数不变时，分子几乎不动、分母 −1 → **人均必然上涨**。
+#   实测：剔掉最远的乘客反而使总费用从 ¥212.78 涨到 ¥222.66。
+#   因此候选集必须覆盖「按距离剔」「按整车剔」两类，而不是只剔最远的人。
+PER_CAPITA_MIN_SERVED = 2  # 最低成团人数：再剔已不成团，直接判「不可达」
+PER_CAPITA_EPS = 1e-9
+# 未达标时的「近似同优」带宽：在人均比最优值高不超过此比例的候选里，挑**保留人数最多**的。
+# 目的：避免给出「剔到只剩 2 人」这种业务上不可执行的建议（剔人越多分母越小，
+# 人均看似越低，这是纯粹的指标游戏）。举例（实测）：剩 2 人 ¥13.39 vs 剩 12 人 ¥14.06，
+# 只贵 0.67 元却多留 10 个人，显然应该建议后者。
+PER_CAPITA_NEAR_PCT = 0.08
+
+
+def per_capita_cost(total_cost: float, served_count: int) -> Optional[float]:
+    """A9：人均车费 = 拼车总费用 / 实际参与人数。分母是被剔除者**不在内**的人数。"""
+    if served_count <= 0:
+        return None
+    return float(total_cost) / float(served_count)
+
+
+def subset_matrix(dm: DistanceMatrix, keep_idx: List[int], dest_idx: int) -> DistanceMatrix:
+    """
+    A9：从整张矩阵裁出「子集 + 终点」的小方阵，供剔除后重解使用。
+    保留 provider 真实数据（高德/百度），不会因为做了剔除就退化成 Haversine。
+    """
+    order = list(keep_idx) + [dest_idx]
+    pts = [dm.points[i] for i in order]
+    raw = None
+    if dm.baidu_matrix is not None:
+        raw = [[dm.baidu_matrix[i][j] for j in order] for i in order]
+    return DistanceMatrix(pts, baidu_matrix=raw)
+
+
+def _estimate_subset(passengers: List[Passenger], dest: Passenger, dm: DistanceMatrix,
+                     keep_idx: List[int], dest_idx: int, capacity: int):
+    """A9：不跑 ALNS 的快速估算（用初始解的费用），仅用于给候选方案排序。"""
+    sub = [passengers[i] for i in keep_idx]
+    subdm = subset_matrix(dm, keep_idx, dest_idx)
+    vs = build_initial_solution(sub, dest, subdm, capacity=capacity)
+    return sum(v.cost for v in vs), len(vs)
+
+
+def suggest_drops(passengers: List[Passenger], dest: Passenger, dm: DistanceMatrix,
+                  cap: Optional[float], current_vehicles: Optional[List[Vehicle]] = None,
+                  current_total: Optional[float] = None,
+                  vehicle_pref: str = VEHICLE_PREF_AUTO,
+                  min_served: int = PER_CAPITA_MIN_SERVED,
+                  max_candidates: int = 24, verify_top: int = 4,
+                  verify_budget_s: float = 3.0) -> Optional[dict]:
+    """
+    A9：人均车费超上限时，搜索「剔除哪些人」能逼近上限。
+
+    候选集三类（去重后先用**快速估算**排序，只对最好的几个做**真实求解**）：
+      C1 距离前缀：按「家→活动点」距离降序，剔掉最远的 m 人（m = 1..n-min_served）
+      C2 整车剔除：剔掉当前解中某辆车的**全部**乘客 —— 车数是唯一的成本阶梯，
+                   只有整车剔除才可能真正减一辆车、把总费用降下来
+    另外始终把「估算达标」的候选与**最保守**的候选优先送进真实求解，
+    避免好方案被估算误差挤掉、或建议被「剔很多人」的极端方案垄断。
+
+    max_candidates : 候选总数上限（整车候选优先保留，距离前缀按需抽样）。
+    verify_top     : 真实求解的候选数；**下限 3**（达标候选×2 + 估算最优 + 最保守）。
+
+    返回 dict（可直接序列化）；cap 为 None 或人数不足时返回 None。
+    """
+    n = len(passengers)
+    if cap is None or n <= min_served:
+        return None
+    dest_idx = n
+    capacity = capacity_limit(vehicle_pref)
+
+    def pc_of(total, cnt):
+        return per_capita_cost(total, cnt)
+
+    cur_total = current_total
+    if cur_total is None and current_vehicles is not None:
+        cur_total = sum(v.cost for v in current_vehicles)
+    cur_v = len(current_vehicles) if current_vehicles else None
+
+    result = {
+        "cap": round(float(cap), 2),
+        "served_count": n,
+        "current_per_capita": round(pc_of(cur_total, n), 2) if cur_total is not None else None,
+        "current_total_cost": round(cur_total, 2) if cur_total is not None else None,
+        "current_vehicle_count": cur_v,
+        "achievable": False,
+        "best": None,
+        "candidates_generated": 0,
+        "candidates_verified": 0,
+        "note": "",
+    }
+
+    # ---- 生成候选（用 frozenset(被剔除的下标) 去重）----
+    cands: dict = {}
+
+    dist = sorted(((dm.get(i, dest_idx)[0], i) for i in range(n)), key=lambda t: -t[0])
+    far_order = [i for _, i in dist]
+    c2_plans = []
+    if current_vehicles:
+        for v in current_vehicles:
+            names = {p.name for p in v.passengers}
+            idxs = frozenset(i for i in range(n) if passengers[i].name in names)
+            if idxs and len(idxs) <= n - min_served:
+                c2_plans.append((idxs, f"整辆剔除 {v.passengers[0].name} 等 {len(idxs)} 人所在车"))
+
+    # 严格限流：整车候选全保留（数量 = 车数），距离前缀按需均匀抽样
+    c1_all = list(range(1, n - min_served + 1))
+    slots = max(1, max_candidates - len(c2_plans))
+    if len(c1_all) > slots:
+        step = int(math.ceil(len(c1_all) / float(slots)))
+        c1_range = c1_all[::step]
+        if c1_all[-1] not in c1_range and len(c1_range) < slots:
+            c1_range.append(c1_all[-1])
+        c1_range = c1_range[:slots]
+    else:
+        c1_range = c1_all
+    for m in c1_range:
+        cands.setdefault(frozenset(far_order[:m]), f"剔除最远的 {m} 人")
+    for idxs, label in c2_plans:
+        cands.setdefault(idxs, label)
+
+    result["candidates_generated"] = len(cands)
+    result["strategy_counts"] = {
+        "距离前缀": len(c1_range),
+        "整车剔除": len(c2_plans),
+    }
+    if not cands:
+        return result
+
+    # ---- 快速估算排序 ----
+    est = []
+    for drop_idx, label in cands.items():
+        keep_idx = [i for i in range(n) if i not in drop_idx]
+        t, v = _estimate_subset(passengers, dest, dm, keep_idx, dest_idx, capacity)
+        est.append({"pc": pc_of(t, len(keep_idx)), "drop_idx": drop_idx, "label": label,
+                    "total": t, "vehicle_count": v, "keep_idx": keep_idx})
+    est.sort(key=lambda e: (e["pc"] is None, e["pc"] if e["pc"] is not None else 1e18))
+
+    est_ok = [e for e in est if e["pc"] is not None and e["pc"] <= cap + PER_CAPITA_EPS]
+    # 必须把「剔得最少」的候选也送进真实求解：只按估算人均排序会偏向「剔很多人」的极端
+    # 方案（分母小 → 人均看着低），导致建议名单不合理。带上最保守的候选，
+    # 再交给下面的「近似同优取保留人数最多」规则去挑。
+    est_small = min(est, key=lambda e: len(e["drop_idx"]))
+    pick, seen = [], set()
+    for e in (est_ok[:2] + [est[0], est_small] + est):
+        if e["drop_idx"] in seen:
+            continue
+        seen.add(e["drop_idx"])
+        pick.append(e)
+        if len(pick) >= max(3, verify_top):
+            break
+
+    # ---- 对候选做真实求解（可复现：固定种子，跑完还原全局 RNG 状态）----
+    verified = []
+    rng_state = random.getstate()
+    try:
+        for e in pick:
+            random.seed(20260101)
+            sub = [passengers[i] for i in e["keep_idx"]]
+            subdm = subset_matrix(dm, e["keep_idx"], dest_idx)
+            best, _ = optimize(sub, dest, subdm, mode="cost",
+                               time_budget_s=verify_budget_s, vehicle_pref=vehicle_pref)
+            total = sum(v.cost for v in best)
+            cnt = len(e["keep_idx"])
+            verified.append({
+                "drop_names": [passengers[i].name for i in range(n) if i in e["drop_idx"]],
+                "drop_count": n - cnt,
+                "keep_count": cnt,
+                "total_cost": round(total, 2),
+                "vehicle_count": len(best),
+                "per_capita": round(pc_of(total, cnt), 2),
+                "per_vehicle_cost": round(total / len(best), 2) if best else None,
+                "meets_cap": pc_of(total, cnt) <= cap + PER_CAPITA_EPS,
+                "strategy": e["label"],
+            })
+    finally:
+        random.setstate(rng_state)
+    result["candidates_verified"] = len(verified)
+    if not verified:
+        return result
+
+    def _rank(c):
+        return (0 if c["meets_cap"] else 1, c["per_capita"])
+
+    verified.sort(key=_rank)
+    ok_list = [c for c in verified if c["meets_cap"]]
+    if ok_list:
+        # 达标者里保留人数最多（同为达标，多留人更好）
+        best = max(ok_list, key=lambda c: c["keep_count"])
+    else:
+        # 都不达标：在「人均与最优值差距 ≤ PER_CAPITA_NEAR_PCT」的候选里挑保留人数最多的，
+        # 避免推荐「剔到只剩 2 人」这种不可执行的方案
+        pc_best = min(c["per_capita"] for c in verified)
+        band = pc_best * (1.0 + PER_CAPITA_NEAR_PCT)
+        near = [c for c in verified if c["per_capita"] <= band]
+        best = max(near, key=lambda c: c["keep_count"])
+    result["best"] = best
+    result["achievable"] = bool(best["meets_cap"])
+    result["suggestions"] = verified
+
+    if best["meets_cap"]:
+        result["note"] = (
+            f"剔除 {best['drop_count']} 人（{('、'.join(best['drop_names']))[:60]}{'…' if len('、'.join(best['drop_names'])) > 60 else ''}）后，"
+            f"人均 ¥{best['per_capita']:.2f} ≤ 上限 ¥{cap:.2f}，剩余 {best['keep_count']} 人可继续参加活动。"
+            f"（策略：{best['strategy']}）")
+    else:
+        vc = best["vehicle_count"] or 1
+        need_per_vehicle = cap * best["keep_count"] / vc
+        need_km = max(0.0, (need_per_vehicle - BASE_FEE) / PER_KM_FEE + FREE_KM)
+        have_km = max(0.0, (best["per_vehicle_cost"] - BASE_FEE) / PER_KM_FEE + FREE_KM)
+        # 若存在「剔得更多但人均反而更高」的候选，顺带说明「剔人不能单调降人均」这一事实
+        far = max(verified, key=lambda c: c["drop_count"])
+        extra = ""
+        if far["drop_count"] > best["drop_count"] and far["per_capita"] > best["per_capita"]:
+            extra = (f"继续剔到只剩 {far['keep_count']} 人时，人均反而回升到 "
+                     f"¥{far['per_capita']:.2f}——剔人并不能单调降低人均。")
+        result["note"] = (
+            f"本批乘客**无法**通过剔人达标：已验证的最省方案是剔除 {best['drop_count']} 人后"
+            f"人均 ¥{best['per_capita']:.2f}，仍高于上限 ¥{cap:.2f}。{extra}"
+            f"根因是车均里程：要达标每辆车平均只能花 ¥{need_per_vehicle:.2f}"
+            f"（≈{need_km:.1f} km），而实测车均 ¥{best['per_vehicle_cost']:.2f}"
+            f"（≈{have_km:.1f} km）。建议把上限放宽到 ¥{best['per_capita']:.2f} 以上，"
+            f"或改用更集中的上车点。")
+    return result
 
 
 # ============ 评价函数（字典序，越小越好） ============

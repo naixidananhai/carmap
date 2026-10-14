@@ -323,6 +323,9 @@ def main():
               (rows or {}).get("count", ""))
 
         print("\n=== 6. 提交任务并验证地图渲染 ===")
+        # A9：先设一个人均上限（示例名单 15 人，人均必然超过 ¥10），
+        # 用于验证「超上限 → 给出建议 → 人工确认 → 重算」这条闭环
+        evaluate(send, "document.getElementById('per_capita_cap').value = '10'")
         evaluate(send, """(() => {
           document.getElementById('submit_btn').click();
         })()""")
@@ -398,6 +401,58 @@ def main():
               f'types={a2.get("types")} 4座={a2.get("four")} 6座={a2.get("six")}')
         check("导出文本包含车型", "座）" in (a2.get("text") or ""))
 
+        # A9：人均车费展示 + 超限时的「建议剔除」卡片。
+        # 关键语义：算法**只给建议、不自动剔除**——必须人工点「确认剔除并重算」。
+        a9 = evaluate(send, """(() => {
+          const r = currentResult || {};
+          const btn = Array.from(document.querySelectorAll('#vehicles_list button'))
+                          .find(b => (b.textContent || '').indexOf('确认剔除并重算') >= 0);
+          const s = r.drop_suggestion || null;
+          return {
+            head: (document.querySelector('#vehicles_list p') || {}).textContent || '',
+            hasBtn: !!btn,
+            cap: r.per_capita_cap, pc: r.per_capita_cost, total: r.total_cost,
+            served: r.served_count, exceeded: r.exceeded,
+            achievable: s ? s.achievable : null,
+            names: (s && s.best) ? s.best.drop_names : [],
+            note: s ? s.note : '',
+            pending: window.PENDING_DROP_NAMES || []
+          };
+        })()""") or {}
+        check("结果列表头展示人均车费与上限",
+              "人均" in (a9.get("head") or "") and "上限 ¥" in (a9.get("head") or ""),
+              (a9.get("head") or "")[:120])
+        check("人均车费是「总费用 ÷ 参与人数」",
+              a9.get("pc") is not None and a9.get("served") == 15
+              and abs(a9.get("pc") * a9.get("served") - a9.get("total")) < 0.05,
+              f'人均 ¥{a9.get("pc")} × {a9.get("served")} 人 '
+              f'≈ ¥{a9.get("total")}')
+        check("超上限被如实标出（exceeded=True）", a9.get("exceeded") is True)
+        check("给出「建议剔除」卡片与确认按钮", a9.get("hasBtn") is True)
+        check("建议名单非空且不是把人全剔了",
+              bool(a9.get("names")) and len(a9.get("names")) < 15,
+              str(a9.get("names")))
+        check("建议文案说清了可达性与根因", bool(a9.get("note")),
+              (a9.get("note") or "")[:70])
+        check("建议名单已挂到 PENDING_DROP_NAMES（点按钮才生效，不自动剔除）",
+              a9.get("pending") == a9.get("names"),
+              str(a9.get("pending")))
+        # 备选方案区：达标方案未必是业务最优，取舍必须摊开给人看
+        a9alt = evaluate(send, """(() => {
+          const opts = window.PENDING_DROP_OPTIONS || [];
+          const rows = Array.from(document.querySelectorAll('#vehicles_list button'))
+              .filter(b => (b.textContent || '').indexOf('采用') >= 0);
+          return { opts: opts.map(o => [o.drop_count, o.per_capita, o.meets_cap]),
+                   rows: rows.length };
+        })()""") or {}
+        if len(a9alt.get("opts") or []) > 1:
+            check("摊开了备选方案（含各自的剔除人数与人均）",
+                  (a9alt.get("rows") or 0) == len(a9alt["opts"]) - 1,
+                  f'备选 {a9alt["opts"]}，按钮 {a9alt.get("rows")} 个')
+        else:
+            check("候选不足时不给备选区（不崩）", (a9alt.get("rows") or 0) == 0,
+                  f'备选 {a9alt["opts"]}')
+
         # A7：任务与结果已写穿 SQLite（前端不需刷新即可被别的客户端读到）
         #
         # 缺陷修复（2026-10-14）：原先这里取 `typeof TASK_ID !== 'undefined' ? TASK_ID : null`，
@@ -430,6 +485,45 @@ def main():
                   bool(r0.get("vehicles"))
                   and all(v.get("vehicle_type") in (4, 6) for v in r0.get("vehicles")),
                   str([v.get("vehicle_type") for v in (r0.get("vehicles") or [])]))
+
+        # 6a. A9：人工确认「剔除并重算」→ 被剔者真的不再参与，人均随之重算
+        drop_names = a9.get("names") or []
+        old_tid = tid
+        if drop_names:
+            print("\n=== 6a. A9：人工确认剔除后重算 ===")
+            evaluate(send, "applyPendingDrops()")
+            ok2 = False
+            for _ in range(90):
+                st2 = evaluate(send, "document.getElementById('progress').style.display")
+                cur = evaluate(send, "(currentResult||{}).task_id || null")
+                if st2 == "none" and cur and cur != old_tid:
+                    ok2 = True
+                    break
+                time.sleep(1.5)
+            check("点「确认剔除并重算」后发起了新一轮求解并完成", ok2,
+                  f"task_id {old_tid} → {cur}")
+            if ok2:
+                after = evaluate(send, """(() => { const r = currentResult || {}; return {
+                    served: r.served_count,
+                    excluded: r.excluded_names || [],
+                    names: (r.vehicles || []).reduce(
+                        (a, v) => a.concat((v.passengers || []).map(p => p.name)), []),
+                    total: r.total_cost, pc: r.per_capita_cost
+                }; })()""") or {}
+                check("参与人数 = 原人数 − 剔除数",
+                      after.get("served") == 15 - len(drop_names),
+                      f'{after.get("served")} vs 15 - {len(drop_names)}')
+                still = sorted(set(drop_names) & set(after.get("names") or []))
+                check("被剔除者确实不在方案里（不再参加活动）", not still,
+                      f'剔除 {drop_names}；仍在方案 {still}')
+                check("excluded_names 回显给前端",
+                      set(after.get("excluded") or []) == set(drop_names),
+                      str(after.get("excluded")))
+                check("人均按「新总费用 ÷ 新参与人数」重算",
+                      after.get("pc") is not None and after.get("served")
+                      and abs(after["pc"] * after["served"] - after["total"]) < 0.05,
+                      f'¥{after.get("total")} ÷ {after.get("served")} 人 '
+                      f'= ¥{after.get("pc")}')
 
         time.sleep(4)
         res = evaluate(send, """(() => {

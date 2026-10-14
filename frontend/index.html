@@ -156,6 +156,11 @@
           <p style="font-size:11px; color:#c0c4cc; margin:4px 0 0;">硬约束：车数不超过此值，再求最省费用</p>
         </div>
         <div style="margin-bottom:14px;">
+          <p class="field-label">人均车费上限（可选）</p>
+          <input class="text-input" id="per_capita_cap" type="number" min="0.01" step="0.5" placeholder="不限">
+          <p style="font-size:11px; color:#c0c4cc; margin:4px 0 0;">人均 = 总车费 ÷ 参与人数。超限时只给「建议剔除」名单，不会自动剔除，需你确认后重算</p>
+        </div>
+        <div style="margin-bottom:14px;">
           <p class="field-label">求解预算（秒）</p>
           <input class="text-input" id="time_budget" type="number" value="10" min="5" max="300">
           <p style="font-size:11px; color:#c0c4cc; margin:4px 0 0;">算得越久越省，10 秒后收益递减</p>
@@ -612,11 +617,51 @@ function openConfirm() {
   document.getElementById('confirm_mask').style.display = 'block';
 }
 
-async function submitTask() {
-  document.getElementById('confirm_mask').style.display = 'none';
+// 组装提交体。excludeNames = A9 人工确认后要剔除的乘客姓名
+// （被剔除者不再参加活动：不计入人均分母、也不进方案）
+function buildPayload(excludeNames) {
+  const ps = collectPassengers();
+  const mvRaw = document.getElementById('max_vehicles').value.trim();
+  const capRaw = document.getElementById('per_capita_cap').value.trim();
+  const cap = capRaw === '' ? null : Number(capRaw);
+  return {
+    passengers: ps.map(p => ({ name: p.name, lat: p.lat, lng: p.lng })),
+    dest_lat: destPoint.lat,
+    dest_lng: destPoint.lng,
+    mode: document.getElementById('opt_mode').value,
+    vehicle_pref: document.getElementById('vehicle_pref').value,
+    time_budget_s: parseInt(document.getElementById('time_budget').value),
+    max_vehicles: mvRaw === '' ? null : Math.max(1, parseInt(mvRaw, 10) || 1),
+    per_capita_cap: (cap != null && cap > 0) ? cap : null,
+    direction: currentDirection,
+    exclude_names: excludeNames || []
+  };
+}
+
+function submitTask() {
   const ps = collectPassengers();
   if (!ps.length || !destPoint) return;
+  runTask(buildPayload([]));
+}
 
+// A9：组织者点「确认剔除并重算」→ 带 exclude_names 重新提交
+function applyDrops(names) {
+  if (!names || !names.length) return;
+  runTask(buildPayload(names));
+}
+
+function applyPendingDrops() {
+  applyDrops(window.PENDING_DROP_NAMES || []);
+}
+
+// A9：备选方案（例如「剔 3 人」比「剔 10 人达标」更划算，这个取舍由人来做）
+function applyPendingOption(i) {
+  const o = (window.PENDING_DROP_OPTIONS || [])[i];
+  if (o && o.drop_names && o.drop_names.length) applyDrops(o.drop_names);
+}
+
+async function runTask(payload) {
+  document.getElementById('confirm_mask').style.display = 'none';
   const btn = document.getElementById('submit_btn');
   btn.disabled = true;
   btn.textContent = '提交中...';
@@ -633,24 +678,20 @@ async function submitTask() {
   }, 1000);
 
   try {
-    // 车辆上限：留空表示不限；填了必须是 >=1 的整数
-    const mvRaw = document.getElementById('max_vehicles').value.trim();
-    const maxVehicles = mvRaw === '' ? null : Math.max(1, parseInt(mvRaw, 10) || 1);
     const resp = await fetch('/api/tasks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        passengers: ps.map(p => ({ name: p.name, lat: p.lat, lng: p.lng })),
-        dest_lat: destPoint.lat,
-        dest_lng: destPoint.lng,
-        mode: document.getElementById('opt_mode').value,
-        vehicle_pref: document.getElementById('vehicle_pref').value,
-        time_budget_s: parseInt(document.getElementById('time_budget').value),
-        max_vehicles: maxVehicles,
-        direction: currentDirection
-      })
+      body: JSON.stringify(payload)
     });
-    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    if (!resp.ok) {
+      // 后端 400 时会带 detail（例如「剔除后低于最低成团人数」），要如实显示
+      let msg = 'HTTP ' + resp.status;
+      try {
+        const e = await resp.json();
+        if (e && e.detail) msg = e.detail;
+      } catch (_) { /* 非 JSON 响应，沿用状态码 */ }
+      throw new Error(msg);
+    }
     const data = await resp.json();
     const taskId = data.task_id;
 
@@ -710,6 +751,78 @@ function solverNoteHTML(r) {
   const bits = ['求解状态 <b>' + jobStateLabel(r.job_status) + '</b>'];
   if (r.gap != null) bits.push('距理论下界 ' + (r.gap * 100).toFixed(0) + '%');
   return ' · ' + bits.join(' · ');
+}
+
+// A9：人均车费 = 总费用 ÷ 参与人数（乘客实付口径，无补贴；被剔除者不在分母内）
+function perCapitaHTML(r) {
+  if (!r || r.per_capita_cost == null) return '';
+  const cap = r.per_capita_cap;
+  const over = (cap != null) && r.per_capita_cost > cap + 1e-9;
+  let s = ' · 人均 <b style="color:' + (over ? '#f56c6c' : '#67c23a') + '">¥' +
+          Number(r.per_capita_cost).toFixed(2) + '</b>';
+  if (cap != null) {
+    s += '<span style="color:#909399;">（上限 ¥' + Number(cap).toFixed(2) +
+         (over ? '，已超出' : '，未超出') + '）</span>';
+  }
+  return s;
+}
+
+function escHTML(s) {
+  return String(s).replace(/[&<>"]/g, c =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+// A9：超限时的「建议剔除」卡片。
+// 关键语义：算法**只给建议、绝不自动剔除**——被剔除者将不能参加活动，
+// 必须由组织者点「确认剔除并重算」把名单带回后端（exclude_names）。
+function dropSuggestionHTML(r) {
+  window.PENDING_DROP_NAMES = [];
+  window.PENDING_DROP_OPTIONS = [];
+  const s = r && r.drop_suggestion;
+  if (!s) return '';
+  const best = s.best || {};
+  const names = best.drop_names || [];
+  const opts = s.suggestions || [];
+  window.PENDING_DROP_NAMES = names;
+  window.PENDING_DROP_OPTIONS = opts;
+  const ok = !!s.achievable;
+  const chips = names.map(n =>
+      '<span style="display:inline-block;padding:1px 7px;margin:2px 4px 2px 0;background:#fdf6ec;' +
+      'border:1px solid #f5dab1;border-radius:4px;font-size:12px;color:#b88230;">' +
+      escHTML(n) + '</span>').join('');
+  let html = '<div style="margin-top:12px;padding:10px 12px;border-radius:6px;background:' +
+      (ok ? '#f0f9eb' : '#fef0f0') + ';border:1px solid ' +
+      (ok ? '#e1f3d8' : '#fde2e2') + ';">';
+  html += '<b style="color:' + (ok ? '#67c23a' : '#f56c6c') + ';">人均车费' +
+      (ok ? '可以达标' : '无法达标') + '</b>';
+  html += '<div style="font-size:12px;color:#606266;margin-top:6px;line-height:1.7;">' +
+      escHTML(s.note || '') + '</div>';
+  if (names.length) {
+    html += '<div style="margin-top:8px;font-size:12px;color:#909399;">建议剔除（共 ' +
+        names.length + ' 人）：</div><div style="margin-top:2px;">' + chips + '</div>';
+    html += '<div style="margin-top:10px;display:flex;gap:10px;align-items:center;">' +
+        '<button class="btn-primary" style="padding:6px 14px;font-size:12px;" ' +
+        'onclick="applyPendingDrops()">确认剔除并重算</button>' +
+        '<span style="font-size:11px;color:#c0c4cc;">被剔除者将不能参加本次活动</span></div>';
+  }
+  // 备选：把「剔得更多」或「剔得更少」的其他已求解方案摊开，让组织者自己取舍。
+  // 达标方案未必是业务最优（例如「剔 10 人达标」vs「剔 3 人只贵 0.7 元」）。
+  const alts = opts.filter(x => x.drop_count !== best.drop_count);
+  if (alts.length) {
+    html += '<div style="margin-top:12px;border-top:1px solid rgba(0,0,0,0.06);' +
+        'padding-top:8px;font-size:12px;color:#909399;">其他可选方案（点右侧直接采用）：</div>';
+    alts.forEach(x => {
+      const i = opts.indexOf(x);
+      html += '<div style="display:flex;align-items:center;gap:8px;padding:3px 0;font-size:12px;">' +
+          '<span style="flex:1;color:#606266;">剔 ' + x.drop_count + ' 人 → 剩 ' +
+          x.keep_count + ' 人 · ' + x.vehicle_count + ' 车 · 人均 <b>¥' +
+          Number(x.per_capita).toFixed(2) + '</b>' +
+          (x.meets_cap ? '（达标）' : '（仍超上限）') + '</span>' +
+          '<button class="btn-primary" style="padding:3px 10px;font-size:11px;" ' +
+          'onclick="applyPendingOption(' + i + ')">采用</button></div>';
+    });
+  }
+  return html + '</div>';
 }
 
 // A2 车型统计：4 座与 6 座计价相同，这里只如实展示派车单构成
@@ -847,7 +960,8 @@ function showResult(result) {
   list.innerHTML = '<p>共 <b>' + result.vehicle_count + '</b> 辆车' +
       vehicleTypeSummary(result) + ' · 出发时间 <b>' +
       (document.getElementById('depart_time').value || '未设置') + '</b>' +
-      solverNoteHTML(result) + '</p>';
+      perCapitaHTML(result) +
+      solverNoteHTML(result) + '</p>' + dropSuggestionHTML(result);
   result.vehicles.forEach((v, idx) => {
     const color = VEHICLE_COLORS[idx % VEHICLE_COLORS.length];
     const orderLine = isDrop

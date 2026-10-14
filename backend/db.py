@@ -257,6 +257,10 @@ _EXTRA_COLUMNS = {
         "lower_bound": "REAL",
         "stop_reason": "TEXT",
     },
+    # A9：人均车费上限（元/人）。老库就地补列，避免新建库脚本与老库结构分叉。
+    "carpool_task": {
+        "per_capita_cap": "REAL",
+    },
 }
 
 
@@ -337,15 +341,15 @@ def save_task(meta: Dict[str, Any]) -> Optional[int]:
            (task_code, task_name, status, passenger_count, destination_name,
             destination_lng, destination_lat, coordinate_type, vehicle_mode,
             optimization_mode, direction, budget_second, max_vehicles,
-            baseline_cost, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            baseline_cost, per_capita_cap, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (meta["task_code"], meta.get("task_name"), meta.get("status", TASK_CREATED),
          meta.get("passenger_count", 0), meta.get("destination_name"),
          meta.get("destination_lng"), meta.get("destination_lat"),
          meta.get("coordinate_type", "BD09"), meta.get("vehicle_mode", "auto"),
          meta.get("optimization_mode", "cost"), meta.get("direction", "pickup"),
          meta.get("budget_second"), meta.get("max_vehicles"),
-         meta.get("baseline_cost"), now_iso(), now_iso()))
+         meta.get("baseline_cost"), meta.get("per_capita_cap"), now_iso(), now_iso()))
     return cur.lastrowid if cur is not None else None
 
 
@@ -516,7 +520,7 @@ def load_result(task_code: str, job: Optional[Dict[str, Any]] = None
     job 为 optimization_job 行时，把 A8 的 8 态状态一并带进结果里。
     """
     rows = _query(
-        """SELECT s.* FROM solution s
+        """SELECT s.*, t.per_capita_cap AS task_per_capita_cap FROM solution s
            JOIN carpool_task t ON t.id = s.task_id
            WHERE t.task_code = ? AND s.is_best = 1
            ORDER BY s.id DESC LIMIT 1""", (task_code,))
@@ -554,6 +558,10 @@ def load_result(task_code: str, job: Optional[Dict[str, Any]] = None
             "cost": v["cost"],
         })
     job = job or {}
+    # A9：人均车费不单独存列 —— 用 总费用 / route_passenger 实际人数 现算，
+    # 这样被剔除的人天然不在分母里，也不会因为补列而破坏老库。
+    served = sum(len(v["passengers"]) for v in vehicles)
+    pc = round(sol["total_cost"] / served, 2) if served and sol["total_cost"] else None
     return {
         "task_id": task_code,
         "status": "DONE",
@@ -575,6 +583,12 @@ def load_result(task_code: str, job: Optional[Dict[str, Any]] = None
         "vehicles": vehicles,
         "error": None,
         "warning": sol["warning"],
+        # A9：恢复出的人均（上限与建议不落库，见 v1.1/A9 说明文档「已知限制」）
+        "served_count": served,
+        "per_capita_cost": pc,
+        "per_capita_cap": sol.get("task_per_capita_cap"),
+        "excluded_names": [],
+        "drop_suggestion": None,
         "_restored_from_db": True,   # 标记：结果来自 SQLite 而非进程内存
     }
 
